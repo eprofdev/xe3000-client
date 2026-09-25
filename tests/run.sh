@@ -307,8 +307,15 @@ X xec del sbad >/dev/null
 
 step "whole LAN through REALITY (profile A)"
 X xec use A >/dev/null
+# another program (e.g. another Xray panel's API) already holds 10085 - the case seen on a real XE3000
+N socat TCP-LISTEN:10085,bind=127.0.0.1,reuseaddr,fork /dev/null >/dev/null 2>&1 &
+sleep 1
 X xec start | sed 's/^/    | /'
 t "tunnel running" X pgrep -f 'run -c /var/run/xe-client/xray.json'
+t "busy port 10085 detected and moved (API_PORT)" X sh -c "grep -q 'port 10085 (API_PORT) is already used' /tmp/xe-client/xec.log && grep -q \"^API_PORT='10086'\" /etc/xe-client/client.conf"
+X xec diag >"$W/diag.txt" 2>&1; sed -n '1,12p' "$W/diag.txt" | sed 's/^/    | /'
+t "xec diag: report with server, ports and config test" sh -c "grep -q 'Configuration OK' '$W/diag.txt' && grep -q '^server : vless tcp/reality' '$W/diag.txt'"
+t "xec diag: no UUID / password inside" sh -c "! grep -q '$UUID' '$W/diag.txt' && ! grep -q 'Pa55-w0rd' '$W/diag.txt' && ! grep -q 'Tr0jan-pass' '$W/diag.txt'"
 out=$(lan_get /hello)
 t "LAN client gets the page" test "$out" = "HELLO-XE3000"
 p=$(lastpeer); echo "    | target saw: $p"
@@ -363,6 +370,8 @@ r=$(api -d "a=exitinfo&csrf=$CS" http://192.168.8.1:8899/cgi-bin/api); echo "   
 t "exit IP / Cloudflare station via web" python3 -c "import json; j=json.loads('''$r'''); assert j['ok'] and j['colo']=='JED'"
 t "backup export" sh -c "ip netns exec xeclan env -u HTTP_PROXY -u http_proxy curl -s -b '$J' 'http://192.168.8.1:8899/cgi-bin/api?a=export' | grep -q '@@FILE profiles/A.conf'"
 api "http://192.168.8.1:8899/cgi-bin/api?a=logs" >"$W/logs.json"
+api "http://192.168.8.1:8899/cgi-bin/api?a=diag" >"$W/diag.json"
+t "logs screen: diagnostic report via web" python3 -c "import json; j=json.load(open('$W/diag.json')); assert j['ok'] and 'XE3000 CLIENT report' in j['msg'] and '$UUID' not in j['msg']"
 t "logs via web" python3 -c "import json; assert json.load(open('$W/logs.json'))['ok']"
 api -d "a=del&name=webA&csrf=$CS" http://192.168.8.1:8899/cgi-bin/api >/dev/null
 api -d "a=del&name=webssh&csrf=$CS" http://192.168.8.1:8899/cgi-bin/api >/dev/null

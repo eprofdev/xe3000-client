@@ -526,6 +526,25 @@ fw_auto() { # firewall include / reload hook
 }
 
 # ---------------------------------------------------------------- service
+# port_busy PORT - something listens on it (TCP or UDP); port_owner PORT - "pid/program"
+port_busy() { netstat -ltnu 2>/dev/null | awk -v p=":$1\$" '$4 ~ p { f = 1 } END { exit !f }'; }
+port_owner() { netstat -ltnup 2>/dev/null | awk -v p=":$1\$" '$4 ~ p { print $NF; exit }'; }
+# fix_ports - move our listeners away from ports another program already uses
+# (e.g. another Xray panel on 10085); runs while our own xray is stopped
+fix_ports() {
+    used=' '
+    for k in SOCKS_PORT HTTP_PORT REDIR_PORT DNS_PORT API_PORT SSH_SOCKS; do
+        eval "p=\$$k"; o=$p; i=0
+        while { port_busy "$p" || case $used in *" $p "*) true ;; *) false ;; esac; } && [ $i -lt 200 ]; do
+            p=$((p + 1)); i=$((i + 1))
+        done
+        if [ "$p" != "$o" ]; then
+            log "port $o ($k) is already used by $(port_owner "$o" || echo '?') - using $p"
+            conf_set "$CONF" "$k" "$p"; eval "$k=$p"
+        fi
+        used="$used$p "
+    done
+}
 cmd_prepare() { # called by the init script
     load_conf
     mkdir -p "$RUN" "$LOGD"
@@ -534,6 +553,7 @@ cmd_prepare() { # called by the init script
         fw_off; log "no active profile - tunnel not started"; return 1
     fi
     [ -x "$XRAY" ] || { log "xray missing"; return 1; }
+    fix_ports; load_conf
     gen_xray "$ACTIVE" "$RUN/xray.json" || return 1
     if ! "$XRAY" run -test -c "$RUN/xray.json" >"$RUN/test.out" 2>&1; then
         log "xray config test failed: $(tail -n 1 "$RUN/test.out")"; return 1
@@ -630,21 +650,39 @@ cmd_test() {
 # everything needed to see why the tunnel does not work (no secrets)
 cmd_diag() {
     load_conf; lan_detect
-    say "== xec $XEC_VERSION | $(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_DESCRIPTION") | $(uname -m)"
-    say "== xray: $("$XRAY" version 2>&1 | head -n 1)"
-    say "== ssh : $(ssh_bin 2>/dev/null || echo 'OpenSSH missing')  sshpass: $(command -v sshpass || echo missing)"
-    say "== LAN : if=$LAN_IF ip=$LAN_IP  active=$ACTIVE route=$ROUTE"
-    say "== profiles:"; cmd_list
+    say "=== XE3000 CLIENT report $(date '+%F %T') (UUIDs and passwords are not included)"
+    say "script : xec $XEC_VERSION | $(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_DESCRIPTION") | $(uname -m) | up $(uptime | sed 's/.*up *//;s/, *load.*//')"
+    say "xray   : $("$XRAY" version 2>&1 | head -n 1)"
+    say "ssh    : $(ssh_bin 2>/dev/null || echo 'OpenSSH missing') | sshpass: $(command -v sshpass || echo missing)"
+    say "memory : $(free 2>/dev/null | awk '/Mem:/{printf "%d MB free of %d MB", $4/1024, $2/1024}')"
+    if is_running; then t="RUNNING"; else t="STOPPED"; fi
+    say "tunnel : $t | active=$ACTIVE | route=$ROUTE dns_tunnel=$DNS_TUNNEL killswitch=$KILLSWITCH failover=$FAILOVER$([ -f "$RUN/fw-suspended" ] && echo ' (suspended)')"
+    say "LAN    : if=$LAN_IF ip=$LAN_IP | web port $WEB_PORT (password: $([ "$WEB_AUTH" = 1 ] && echo on || echo off))"
     if [ -n "$ACTIVE" ] && prof_exists "$ACTIVE"; then
-        say "== config test ($ACTIVE):"
-        gen_xray "$ACTIVE" /tmp/xec-diag.json && "$XRAY" run -test -c /tmp/xec-diag.json 2>&1 | tail -n 4
+        load_prof "$ACTIVE"
+        if [ "$P_TYPE" = ssh ]; then
+            say "server : ssh/$P_TRANS $P_USER@$P_ADDR:$P_PORT sni=${P_SNI:--} ws-host=${P_WSHOST:--} path=${P_WSPATH:--} auth=$P_AUTH"
+        else
+            say "server : $P_TYPE $P_NET/$P_SEC $P_ADDR:$P_PORT sni=${P_SNI:--} host=${P_HOST:--} path=${P_PATH:-${P_SVC:--}} fp=${P_FP:--} flow=${P_FLOW:--}$([ -n "$P_PCS" ] && echo ' pcs=set')$([ -n "$P_PBK" ] && echo ' pbk=set')$([ -n "$P_PQV" ] && echo ' pqv=set')"
+        fi
+        say "--- config test"
+        gen_xray "$ACTIVE" /tmp/xec-diag.json && "$XRAY" run -test -c /tmp/xec-diag.json 2>&1 | grep -v 'Penetrates\|unified platform\|Reading config' | tail -n 4
         rm -f /tmp/xec-diag.json
     fi
-    say "== listening:"; netstat -ltnup 2>/dev/null | grep -E "xray|:($SOCKS_PORT|$REDIR_PORT|$DNS_PORT|$WEB_PORT) " | head -n 12
-    say "== processes:"; ps w | grep -E '[x]ray|[s]sh .*-D|[u]httpd.*xe-client' | cut -c1-150
-    say "== xec log:"; tail -n 15 "$LOGF" 2>/dev/null
-    say "== xray log:"; tail -n 15 "$LOGD/xray.log" 2>/dev/null
-    say "== system log:"; logread -e xe-client 2>/dev/null | tail -n 15
+    if is_running; then
+        r=$(curl_socks "$SOCKS_PORT" "$CHECK_URL")
+        say "--- tunnel check: HTTP ${r%% *} in ${r#* }s via socks :$SOCKS_PORT ($CHECK_URL)"
+    fi
+    say "--- ports (ours: socks $SOCKS_PORT http $HTTP_PORT redir $REDIR_PORT dns $DNS_PORT api $API_PORT ssh-socks $SSH_SOCKS)"
+    for p in $SOCKS_PORT $HTTP_PORT $REDIR_PORT $DNS_PORT $API_PORT $SSH_SOCKS; do
+        o=$(port_owner "$p"); [ -n "$o" ] && say "  $p used by $o"
+    done
+    say "--- other proxy programs running"
+    ps w | grep -E '[x]ray|[v]2ray|[s]ing-box|[h]ysteria|[s]sh .*-D|[o]penvpn|[w]ireguard' | grep -v "$RUN/xray.json" | cut -c1-140 | head -n 8
+    say "--- saved servers"; cmd_list
+    say "--- xec log"; tail -n 20 "$LOGF" 2>/dev/null
+    say "--- xray log (errors)"; tail -n 20 "$LOGD/xray.log" 2>/dev/null
+    say "--- system log"; logread -e xe-client 2>/dev/null | tail -n 15
     return 0
 }
 cmd_ping() { for n in $(prof_list); do printf '%-16s ' "$n"; probe "$n"; done; }
@@ -1056,7 +1094,7 @@ cmd_cgi() {
     [ "$WEB_AUTH" != 1 ] || cgi_session || { printf 'Status: 401 Unauthorized\r\nContent-Type: application/json\r\n\r\n{"ok":false,"auth":false}\n'; exit 0; }
     if [ "${REQUEST_METHOD:-}" = POST ]; then
         [ "$(fv csrf)" = "$CSRF" ] || reply_err "bad CSRF token - reload the page"
-    elif [ "$a" != status ] && [ "$a" != logs ] && [ "$a" != csrf ] && [ "$a" != export ]; then
+    elif [ "$a" != status ] && [ "$a" != logs ] && [ "$a" != diag ] && [ "$a" != csrf ] && [ "$a" != export ]; then
         reply_err "POST only"
     fi
     case $a in
@@ -1069,6 +1107,7 @@ cmd_cgi() {
             printf 'Status: 200 OK\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename="xe-client-backup.txt"\r\nCache-Control: no-store\r\n\r\n'
             cmd_export; exit 0 ;;
         exitinfo) cgi_exitinfo ;;
+        diag) dgf="$RUN/diag.$$"; (cmd_diag) >"$dgf" 2>&1; t=$(sed 's/\x1b\[[0-9;]*m//g' "$dgf" | jtext); rm -f "$dgf"; reply "{\"ok\":true,\"msg\":$t}" ;;
         start) run_json cmd_start ;;
         stop) run_json cmd_stop ;;
         restart) run_json cmd_start ;;
@@ -1229,7 +1268,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
 <div id="login" class="card hide"><h3>XE3000 Client</h3><label>كلمة المرور / Password</label><input id="lp" type="password" autocomplete="current-password"><br><br><button class="btn" id="lb">دخول</button><p class="mut">نسيت كلمة المرور؟ عبر SSH: <code>xec web password</code></p></div>
 <div id="app" class="hide">
 <header><b>XE3000 Client</b><span id="hb" class="badge y">…</span><span class="sp"></span><button class="btn sec" id="lo">خروج</button></header>
-<nav id="nav"><button data-t="st" class="on">الحالة</button><button data-t="pr">الخوادم</button><button data-t="ad">إضافة</button><button data-t="se">الإعدادات</button><button data-t="to">الأدوات</button></nav>
+<nav id="nav"><button data-t="st" class="on">الحالة</button><button data-t="pr">الخوادم</button><button data-t="ad">إضافة</button><button data-t="se">الإعدادات</button><button data-t="lg">السجلات</button><button data-t="to">الأدوات</button></nav>
 <main>
 <section id="t-st">
  <div class="card"><h3>الاتصال</h3>
@@ -1299,6 +1338,10 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
  <label>وجهات مباشرة (IP/CIDR أو domain:example.sa)</label><input id="v-BYPASS_DST" placeholder="domain:gov.sa 1.2.3.0/24">
  <label>رابط فحص الاتصال</label><input id="v-CHECK_URL"><br><br>
  <button class="btn" id="se-go">حفظ الإعدادات</button></div></section>
+<section id="t-lg" class="hide"><div class="card"><h3>السجلات والتشخيص</h3>
+ <p class="mut">تقرير كامل بحالة النفق والسيرفر والمنافذ والأخطاء. لا يحتوي على UUID أو كلمات المرور، ويمكنك نسخه وإرساله للمساعدة.</p>
+ <button class="btn" id="lg-r">تحديث</button><button class="btn sec" id="lg-c">نسخ التقرير</button><label style="display:inline-flex;gap:6px;align-items:center;margin:0 8px"><input type="checkbox" id="lg-a" style="width:auto"> تحديث تلقائي</label>
+ <pre id="lg-out" style="max-height:70vh">…</pre></div></section>
 <section id="t-to" class="hide">
  <div class="card"><h3>الأدوات</h3>
   <button class="btn" data-a="test">اختبار النفق</button><button class="btn sec" data-a="update">تحديث Xray</button><button class="btn sec" data-a="watchdog">تشغيل المراقب الآن</button><button class="btn sec" id="lg">السجلات</button><a class="btn sec" href="cgi-bin/api?a=export" style="text-decoration:none;display:inline-block"><button class="btn sec" type="button">تصدير نسخة احتياطية</button></a>
@@ -1326,8 +1369,16 @@ function showLogin(){$("app").classList.add("hide");$("login").classList.remove(
 $("lb").onclick=function(){var p=new URLSearchParams();p.append("a","login");p.append("pass",$("lp").value);fetch("cgi-bin/api",{method:"POST",body:p,credentials:"same-origin"}).then(function(r){return r.json()}).then(function(j){if(j.ok){CSRF=j.csrf;$("lp").value="";start()}else toast(j.msg,true)})};
 $("lp").onkeydown=function(e){if(e.key=="Enter")$("lb").onclick()};
 $("lo").onclick=function(){api("logout",{}).then(function(){location.reload()})};
+function loadDiag(){$("lg-r").disabled=true;api("diag").then(function(j){$("lg-r").disabled=false;$("lg-out").textContent=j.msg||"-"}).catch(function(){$("lg-r").disabled=false})}
+$("lg-r").onclick=loadDiag;
+setInterval(function(){if(tab=="lg"&&$("lg-a").checked)loadDiag()},10000);
+function copyText(t){ // http:// pages have no navigator.clipboard - fall back to a hidden textarea
+  if(navigator.clipboard&&window.isSecureContext)return navigator.clipboard.writeText(t).then(function(){return true},function(){return fallback()});
+  return Promise.resolve(fallback());
+  function fallback(){var a=document.createElement("textarea");a.value=t;a.setAttribute("readonly","");a.style.position="fixed";a.style.top="-1000px";document.body.appendChild(a);a.select();a.setSelectionRange(0,t.length);var ok=false;try{ok=document.execCommand("copy")}catch(e){}document.body.removeChild(a);return ok}}
+$("lg-c").onclick=function(){copyText($("lg-out").textContent).then(function(ok){toast(ok?"تم نسخ التقرير":"لم يتم النسخ - حدد النص يدوياً",!ok)})};
 function start(){$("login").classList.add("hide");$("app").classList.remove("hide");load();clearInterval(timer);timer=setInterval(function(){if(tab=="st")load()},5000)}
-document.querySelectorAll("#nav button").forEach(function(b){b.onclick=function(){tab=b.dataset.t;document.querySelectorAll("#nav button").forEach(function(x){x.classList.toggle("on",x==b)});document.querySelectorAll("main>section").forEach(function(s){s.classList.toggle("hide",s.id!="t-"+tab)});if(tab=="se")fillSettings()}});
+document.querySelectorAll("#nav button").forEach(function(b){b.onclick=function(){tab=b.dataset.t;if(tab=="lg")loadDiag();document.querySelectorAll("#nav button").forEach(function(x){x.classList.toggle("on",x==b)});document.querySelectorAll("main>section").forEach(function(s){s.classList.toggle("hide",s.id!="t-"+tab)});if(tab=="se")fillSettings()}});
 document.querySelectorAll("[data-a]").forEach(function(b){b.onclick=function(){act(b.dataset.a,{},b).then(function(j){if(j&&["test","update","watchdog","ping"].indexOf(b.dataset.a)>=0){$("out").textContent=j.msg;$("out").classList.remove("hide")}})}});
 function kind(p){if(p.type=="ssh")return'<span class="chip">SSH</span><span class="chip">'+esc(p.trans)+'</span>';var h='<span class="chip">'+esc(String(p.type).toUpperCase())+'</span><span class="chip">'+esc(p.net)+'</span><span class="chip">'+esc(p.sec)+'</span>';if(p.flow)h+='<span class="chip">Vision</span>';if(p.pq_sig)h+='<span class="chip">PQ-sig</span>';if(p.pq_enc)h+='<span class="chip">PQ-enc</span>';if(p.pinned)h+='<span class="chip">pinned</span>';return h}
 function load(){api("status").then(function(j){S=j;$("lo").classList.toggle("hide",!j.auth);$("pw-card").classList.toggle("hide",!j.auth);
