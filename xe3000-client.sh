@@ -32,7 +32,13 @@ SELF=/usr/bin/xec
 MENU_CMD=/usr/bin/menu1
 INIT=/etc/init.d/xe-client
 INIT_WEB=/etc/init.d/xe-client-web
-XRAY_REPO=https://github.com/XTLS/Xray-core
+XRAY_REPO=${XEC_XRAY_REPO:-https://github.com/XTLS/Xray-core}
+# fallback when github.com is unreachable (it has no IPv6): a copy of the OFFICIAL
+# release in this project's repo (raw.githubusercontent.com has IPv6), checked
+# against the official SHA2-256 below (from the release .dgst), not the mirror
+XRAY_MIRROR=${XEC_XRAY_MIRROR:-https://raw.githubusercontent.com/eprofdev/xe3000-client/main/xray}
+XRAY_PIN_VER=v26.9.9
+XRAY_PIN_SHA_arm64_v8a=3e38d72dfc5eb65c91df0e5583e9b6676c32232041da47de6ae73946b526d66c
 
 umask 022
 
@@ -945,16 +951,31 @@ xray_install() {
     if [ -z "$zip" ]; then
         a=$(xray_arch) || die "unsupported CPU: $(uname -m)"
         if [ -z "$ver" ]; then
-            ver=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$XRAY_REPO/releases/latest" 2>/dev/null | sed 's#.*/tag/##')
+            say "checking the latest Xray release on github.com ..."
+            ver=$(curl -fsSLI --connect-timeout 15 --max-time 40 -o /dev/null -w '%{url_effective}' "$XRAY_REPO/releases/latest" 2>/dev/null | sed 's#.*/tag/##')
         fi
-        match 'v[0-9]+(\.[0-9]+){1,3}' "$ver" || die "cannot find the latest Xray release (network?)"
-        cur=$("$XRAY" version 2>/dev/null | head -n 1 | awk '{print $2}')
-        if [ "v$cur" = "$ver" ] && [ -z "${FORCE:-}" ]; then ok "Xray $ver is already installed"; rm -rf "$tmp"; return 0; fi
-        say "downloading Xray $ver ($a) from $XRAY_REPO ..."
-        u="$XRAY_REPO/releases/download/$ver/Xray-linux-$a.zip"
-        curl -fL --retry 3 --connect-timeout 20 -o "$tmp/x.zip" "$u" || die "download failed: $u"
-        curl -fsL --retry 3 --connect-timeout 20 -o "$tmp/x.dgst" "$u.dgst" || die "download failed: $u.dgst"
-        zip=$tmp/x.zip dg=$tmp/x.dgst
+        pin=''
+        eval "pin=\${XRAY_PIN_SHA_$(printf '%s' "$a" | tr '-' '_'):-}"
+        if match 'v[0-9]+(\.[0-9]+){1,3}' "$ver"; then
+            cur=$("$XRAY" version 2>/dev/null | head -n 1 | awk '{print $2}')
+            if [ "v$cur" = "$ver" ] && [ -z "${FORCE:-}" ]; then ok "Xray $ver is already installed"; rm -rf "$tmp"; return 0; fi
+            say "downloading Xray $ver ($a) from $XRAY_REPO ..."
+            u="$XRAY_REPO/releases/download/$ver/Xray-linux-$a.zip"
+            if curl -fL --retry 2 --connect-timeout 20 --speed-limit 1024 --speed-time 60 -o "$tmp/x.zip" "$u" &&
+                curl -fsL --retry 2 --connect-timeout 20 --max-time 60 -o "$tmp/x.dgst" "$u.dgst"; then
+                zip=$tmp/x.zip dg=$tmp/x.dgst
+            fi
+        fi
+        if [ -z "$zip" ]; then
+            [ -n "$pin" ] || die "cannot reach github.com (test: curl -sI -m 10 https://github.com). Offline: --xray-zip Xray-linux-$a.zip --xray-dgst Xray-linux-$a.zip.dgst"
+            cur=$("$XRAY" version 2>/dev/null | head -n 1 | awk '{print $2}')
+            if [ "v$cur" = "$XRAY_PIN_VER" ] && [ -z "${FORCE:-}" ]; then ok "Xray $XRAY_PIN_VER is already installed"; rm -rf "$tmp"; return 0; fi
+            warn "github.com unreachable - using the project copy of the official Xray $XRAY_PIN_VER (IPv6 ok)"
+            u="$XRAY_MIRROR/$XRAY_PIN_VER/Xray-linux-$a.zip"
+            curl -fL --retry 3 --connect-timeout 20 --speed-limit 1024 --speed-time 60 -o "$tmp/x.zip" "$u" || { rm -rf "$tmp"; die "download failed: $u"; }
+            printf 'SHA2-256= %s\n' "$pin" >"$tmp/x.dgst"
+            zip=$tmp/x.zip dg=$tmp/x.dgst
+        fi
     fi
     want=$(sed -n 's/^SHA2-256= *\([0-9a-fA-F]\{64\}\).*/\1/p' "$dg" | head -n 1 | tr 'A-F' 'a-f')
     got=$(sha256sum "$zip" | cut -d' ' -f1)
