@@ -8,14 +8,17 @@
 | **VLESS + XTLS-Vision + REALITY** | SNI (`sni`)، المفتاح العام (`pbk`)، `sid`، `spx`، بصمة المتصفح (`fp=chrome`) |
 | **REALITY + ML-DSA-65** | توقيع مقاوم للحوسبة الكمية (المعامل `pqv`). يشترط أن يرسل موقع الـ REALITY في السيرفر (dest/target) سلسلة شهادات كبيرة (أكثر من 3.5 كيلوبايت تقريباً)، وإلا يفشل الاتصال |
 | **VLESS Encryption** | `mlkem768x25519plus` (ML-KEM-768، مقاوم للحوسبة الكمية) مع Vision |
+| **VMess** | روابط `vmess://` (WS / TCP / gRPC / HTTPUpgrade / XHTTP، مع TLS أو بدونه) |
+| **Trojan** | روابط `trojan://` (TLS أو REALITY، مع TCP أو WS أو gRPC) |
 | XHTTP / gRPC / WS / HTTPUpgrade / TLS | أي رابط `vless://` حديث |
-| **SSH** | مباشر، **SSH عبر TLS مع SNI** (Bug host)، SSH عبر WebSocket (Payload)، SSH عبر WebSocket + TLS مع SNI. المصادقة بكلمة مرور أو بمفتاح ed25519 |
+| تثبيت الشهادة | `pcs=` (بصمة SHA-256 للشهادة) و`vcn=`، وهما بديل `allowInsecure` الذي حذفه Xray، للسيرفرات ذات الشهادة الموقعة ذاتياً |
+| **SSH** | مباشر، **SSH عبر TLS مع SNI** (Bug host)، SSH عبر WebSocket (Payload)، **SSH WSS** (WebSocket + TLS مع SNI، الخيار 13 في `menu1`). المصادقة بكلمة مرور أو بمفتاح ed25519 |
 
 المحرك هو **Xray-core الرسمي**: يُثبَّت آخر إصدار من صفحة إصدارات XTLS/Xray-core، ويُرفض الملف إن لم تطابق بصمة SHA-256 ملف `.dgst` الرسمي. أما SSH فيعمل عبر OpenSSH.
 الاختبار جرى مع Xray **v26.9.9**، وهو آخر إصدار حتى 2026-09-25.
 
 ## المميزات
-- **لوحة ويب** كاملة بالعربية وتعمل على الجوال: `http://192.168.8.1:8899`
+- **لوحة ويب** كاملة بالعربية وتعمل على الجوال: `http://192.168.8.1:8899`، وتفتح **بدون كلمة مرور** (على الشبكة المحلية فقط). لإضافة كلمة مرور: `xec web auth on` أو من الإعدادات في اللوحة
   - إضافة الخوادم وتعديلها واختبارها واختيار النشط منها
   - التشغيل والإيقاف، وعرض IP الخروج والدولة ومحطة Cloudflare وزمن الاستجابة
   - عدادات الرفع والتنزيل، وكل الإعدادات، والسجلات، وتحديث Xray، ونسخة احتياطية، وتغيير كلمة المرور
@@ -29,7 +32,8 @@
 - **الأمان:**
   - لا تظهر كلمات المرور في قائمة العمليات ولا في السجلات، والملفات بصلاحية 600.
   - تُفحص كل المدخلات قبل استخدامها.
-  - لوحة الويب تعمل على الشبكة المحلية فقط، مع حماية CSRF، وقفل لمدة 5 دقائق بعد 5 محاولات خاطئة.
+  - لوحة الويب تعمل على الشبكة المحلية فقط، مع حماية CSRF (حتى بدون كلمة مرور لا يستطيع أي موقع خارجي التحكم بها) ورفض أسماء Host الغريبة (DNS rebinding). عند تفعيل كلمة المرور: قفل لمدة 5 دقائق بعد 5 محاولات خاطئة.
+  - بدون كلمة مرور، أي جهاز متصل بشبكتك يستطيع فتح اللوحة وتصدير الإعدادات بما فيها كلمات مرور السيرفرات. فعّل كلمة المرور إذا كانت شبكتك مشتركة.
 
 ## التثبيت
 ادخل على الراوتر: `ssh root@192.168.8.1` (بنفس كلمة مرور لوحة الراوتر)، ثم نفّذ:
@@ -59,7 +63,7 @@ xec add-ssh k1 --host 1.2.3.4 --user root --key && xec ssh-key   # أضف الم
 xec start | stop | status | test | test myvps | ping
 xec use myvps | list | del NAME
 xec set KILLSWITCH 0 | xec set FAILOVER 1 | xec route off | xec bypass add 192.168.8.50
-xec web password | xec update-xray | xec logs | xec export > backup.txt | xec restore backup.txt
+xec web auth on|off | xec web password | xec update-xray | xec logs | xec export > backup.txt | xec restore backup.txt
 xec uninstall [--purge]
 ```
 

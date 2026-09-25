@@ -105,13 +105,25 @@ urlenc() {
         if ((n>=48&&n<=57)||(n>=65&&n<=90)||(n>=97&&n<=122)||n==45||n==46||n==95||n==126) printf "%c", n; else printf "%%%s", $1 }'
 }
 rand_hex() { head -c "${1:-16}" /dev/urandom | hexdump -v -e '/1 "%02x"'; }
+# base64 / base64url decode (busybox on OpenWrt has no base64 applet)
+b64dec() {
+    printf '%s' "$1" | tr -- '-_' '+/' | tr -d ' \r\n=' | awk '
+        BEGIN { a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" }
+        { s = s $0 }
+        END { n = 0; bits = 0
+              for (i = 1; i <= length(s); i++) {
+                  v = index(a, substr(s, i, 1)) - 1; if (v < 0) continue
+                  bits = bits * 64 + v; n += 6
+                  if (n >= 8) { n -= 8; c = int(bits / 2 ^ n); bits -= c * 2 ^ n; printf "%c", c }
+              } }'
+}
 
 # ---------------------------------------------------------------- config
 defaults() {
     ACTIVE='' ROUTE=all DNS_TUNNEL=1 DNS_SERVER=1.1.1.1 BLOCK_QUIC=1 BLOCK_V6=1
     KILLSWITCH=1 FAILOVER=1 BYPASS_SRC='' BYPASS_DST='' LAN_IF='' LAN_IP=''
     SOCKS_PORT=10808 HTTP_PORT=10809 REDIR_PORT=10810 DNS_PORT=10853 API_PORT=10085 SSH_SOCKS=10811
-    WEB=1 WEB_PORT=8899 LOGLEVEL=warning SNIFF=1
+    WEB=1 WEB_PORT=8899 WEB_AUTH=0 LOGLEVEL=warning SNIFF=1
     CHECK_URL=https://www.gstatic.com/generate_204
     TRACE_URL=https://www.cloudflare.com/cdn-cgi/trace
 }
@@ -128,7 +140,7 @@ conf_set() {
     printf '%s=%s\n' "$2" "$(shq "$3")" >>"$1.tmp.$$"
     chmod 600 "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"
 }
-PKEYS='TYPE REMARK ADDR PORT UUID FLOW ENC SEC SNI PBK SID SPX FP PQV NET PATH HOST MODE SVC ALPN USER AUTH TRANS WSHOST WSPATH PAYLOAD'
+PKEYS='TYPE REMARK ADDR PORT UUID FLOW ENC SEC SNI PBK SID SPX FP PQV NET PATH HOST MODE SVC ALPN PCS VCN USER AUTH TRANS WSHOST WSPATH PAYLOAD'
 prof_clear() { for k in $PKEYS; do eval "P_$k=''"; done; }
 prof_exists() { match "$RE_NAME" "$1" && [ -f "$PROF/$1.conf" ]; }
 load_prof() {
@@ -171,6 +183,19 @@ split_hostport() { # HOSTPORT -> H P
         *) H=$1; P='' ;;
     esac
 }
+# transport / security parameters shared by vless:// and trojan://
+qp_stream() {
+    P_SNI=$(qp sni); [ -n "$P_SNI" ] || P_SNI=$(qp peer)
+    P_PBK=$(qp pbk); P_SID=$(qp sid); P_SPX=$(qp spx); P_FP=$(qp fp); P_PQV=$(qp pqv)
+    P_NET=$(qp type); P_NET=${P_NET:-tcp}
+    P_PATH=$(qp path); P_HOST=$(qp host); P_MODE=$(qp mode); P_SVC=$(qp serviceName); P_ALPN=$(qp alpn)
+    P_PCS=$(qp pcs); P_VCN=$(qp vcn)
+    case $(qp allowInsecure)$(qp insecure) in *1* | *true*)
+        [ -n "$P_PCS" ] || warn "allowInsecure was removed from Xray - self-signed servers need pcs= (certificate SHA-256)" ;;
+    esac
+    [ "$(qp headerType)" = http ] && { err "tcp+http header is not supported"; return 1; }
+    return 0
+}
 # parse_link LINK -> P_* ; LNAME = remark from #fragment
 parse_link() {
     prof_clear
@@ -190,10 +215,31 @@ parse_link() {
             P_ENC=$(qp encryption); P_ENC=${P_ENC:-none}
             P_FLOW=$(qp flow)
             P_SEC=$(qp security); P_SEC=${P_SEC:-none}
-            P_SNI=$(qp sni); [ -n "$P_SNI" ] || P_SNI=$(qp peer)
-            P_PBK=$(qp pbk); P_SID=$(qp sid); P_SPX=$(qp spx); P_FP=$(qp fp); P_PQV=$(qp pqv)
-            P_NET=$(qp type); P_NET=${P_NET:-tcp}
-            P_PATH=$(qp path); P_HOST=$(qp host); P_MODE=$(qp mode); P_SVC=$(qp serviceName); P_ALPN=$(qp alpn)
+            qp_stream
+            ;;
+        trojan://*)
+            l=${l#trojan://}; l=${l%/}
+            P_TYPE=trojan
+            P_UUID=$(urldec "${l%@*}")
+            split_hostport "${l##*@}"; P_ADDR=$H; P_PORT=${P:-443}
+            P_SEC=$(qp security); P_SEC=${P_SEC:-tls}
+            qp_stream
+            ;;
+        vmess://*)
+            j=$(b64dec "${l#vmess://}")
+            printf '%s' "$j" | jsonfilter -e '@.add' >/dev/null 2>&1 || { err "bad vmess:// link (base64 JSON expected)"; return 1; }
+            jf() { printf '%s' "$j" | jsonfilter -e "@.$1" 2>/dev/null; }
+            P_TYPE=vmess
+            P_ADDR=$(jf add); P_PORT=$(jf port); P_UUID=$(jf id)
+            P_ENC=$(jf scy); P_ENC=${P_ENC:-auto}
+            P_NET=$(jf net); P_NET=${P_NET:-tcp}
+            [ "$(jf type)" = http ] && { err "vmess tcp+http header is not supported"; return 1; }
+            P_HOST=$(jf host); P_PATH=$(jf path); P_SNI=$(jf sni); P_ALPN=$(jf alpn); P_FP=$(jf fp)
+            [ "$P_NET" = grpc ] && { P_SVC=$P_PATH; P_PATH=''; }
+            P_SEC=$(jf tls); [ "$P_SEC" = tls ] || P_SEC=none
+            [ "$(jf aid)" = "" ] || [ "$(jf aid)" = 0 ] || warn "alterId $(jf aid) ignored (VMess AEAD only)"
+            LNAME=$(jf ps)
+            P_PCS=$(jf pcs); P_VCN=$(jf vcn)
             ;;
         ssh://*)
             l=${l#ssh://}; l=${l%/}
@@ -207,7 +253,7 @@ parse_link() {
             P_SNI=$(qp sni); P_WSHOST=$(qp host); P_WSPATH=$(qp path); P_PAYLOAD=$(qp payload)
             if [ -n "$SSH_PASS" ]; then P_AUTH=pass; else P_AUTH=key; fi
             ;;
-        *) err "unsupported link (vless:// or ssh://)"; return 1 ;;
+        *) err "unsupported link (vless:// vmess:// trojan:// ssh://)"; return 1 ;;
     esac
     P_REMARK=$LNAME
     check_prof
@@ -217,11 +263,23 @@ check_prof() {
     match "$RE_HOST" "$P_ADDR" || { err "bad server address: $P_ADDR"; return 1; }
     valid_port "$P_PORT" || { err "bad port: $P_PORT"; return 1; }
     [ -z "$P_REMARK" ] || match '[^"\\]{1,64}' "$P_REMARK" || P_REMARK=''
-    if [ "$P_TYPE" = vless ]; then
-        match '[A-Za-z0-9_-]{1,64}' "$P_UUID" || { err "bad UUID"; return 1; }
-        match '[A-Za-z0-9._-]+' "$P_ENC" && maxlen 2000 "$P_ENC" || { err "bad encryption"; return 1; }
-        [ -z "$P_FLOW" ] || match 'xtls-rprx-vision(-udp443)?' "$P_FLOW" || { err "bad flow: $P_FLOW"; return 1; }
-        match 'reality|tls|none' "$P_SEC" || { err "bad security: $P_SEC"; return 1; }
+    if [ "$P_TYPE" = vless ] || [ "$P_TYPE" = vmess ] || [ "$P_TYPE" = trojan ]; then
+        case $P_TYPE in
+            vless)
+                match '[A-Za-z0-9_-]{1,64}' "$P_UUID" || { err "bad UUID"; return 1; }
+                match '[A-Za-z0-9._-]+' "$P_ENC" && maxlen 2000 "$P_ENC" || { err "bad encryption"; return 1; }
+                [ -z "$P_FLOW" ] || match 'xtls-rprx-vision(-udp443)?' "$P_FLOW" || { err "bad flow: $P_FLOW"; return 1; }
+                match 'reality|tls|none' "$P_SEC" || { err "bad security: $P_SEC"; return 1; } ;;
+            vmess)
+                match '[0-9a-fA-F-]{32,36}' "$P_UUID" || { err "bad VMess id (UUID)"; return 1; }
+                match 'auto|aes-128-gcm|chacha20-poly1305|none|zero' "$P_ENC" || { err "bad VMess security: $P_ENC"; return 1; }
+                match 'tls|none' "$P_SEC" || { err "bad security: $P_SEC"; return 1; }
+                P_FLOW='' ;;
+            trojan)
+                match '[!-~]{1,128}' "$P_UUID" || { err "bad Trojan password"; return 1; }
+                match 'reality|tls|none' "$P_SEC" || { err "bad security: $P_SEC"; return 1; }
+                P_FLOW='' P_ENC='' ;;
+        esac
         [ "$P_NET" = raw ] && P_NET=tcp
         match 'tcp|xhttp|grpc|ws|httpupgrade' "$P_NET" || { err "unsupported transport: $P_NET"; return 1; }
         [ -z "$P_SNI" ] || match "$RE_HOST" "$P_SNI" || { err "bad SNI: $P_SNI"; return 1; }
@@ -240,6 +298,8 @@ check_prof() {
         [ -z "$P_MODE" ] || match 'auto|packet-up|stream-up|stream-one' "$P_MODE" || { err "bad xhttp mode"; return 1; }
         [ -z "$P_SVC" ] || match '[A-Za-z0-9._/-]{1,100}' "$P_SVC" || { err "bad serviceName"; return 1; }
         [ -z "$P_ALPN" ] || match '[A-Za-z0-9./,-]{1,50}' "$P_ALPN" || { err "bad alpn"; return 1; }
+        [ -z "$P_PCS" ] || { match '[0-9a-fA-F:, ]{64,}' "$P_PCS" && maxlen 700 "$P_PCS"; } || { err "bad pcs (certificate SHA-256 hex)"; return 1; }
+        [ -z "$P_VCN" ] || match "$RE_HOST" "$P_VCN" || { err "bad vcn"; return 1; }
         # Vision needs the raw TCP transport
         [ "$P_NET" = tcp ] || P_FLOW=''
     elif [ "$P_TYPE" = ssh ]; then
@@ -256,7 +316,7 @@ check_prof() {
     return 0
 }
 name_from() { # suggestion from remark
-    n=$(printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '_' | cut -c1-32)
+    n=$(printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '_' | tr -s '_' | sed 's/^_*//; s/_*$//' | cut -c1-32)
     match "$RE_NAME" "$n" && ! match '_+' "$n" || n=''
     if [ -z "$n" ]; then i=1; while prof_exists "p$i"; do i=$((i + 1)); done; n="p$i"; fi
     printf '%s' "$n"
@@ -283,6 +343,9 @@ outbound_json() { # uses P_*, $1 = ssh socks port
             if [ -n "$P_ALPN" ]; then
                 s="$s,\"alpn\":[$(printf '%s' "$P_ALPN" | awk -F, '{for(i=1;i<=NF;i++) printf "%s\"%s\"", (i>1?",":""), $i}')]"
             fi
+            # certificate pinning / name check (Xray replaced allowInsecure with these)
+            [ -n "$P_PCS" ] && s="$s,\"pinnedPeerCertSha256\":$(js "$P_PCS")"
+            [ -n "$P_VCN" ] && s="$s,\"verifyPeerCertByName\":$(js "$P_VCN")"
             s="$s}" ;;
     esac
     case $net in
@@ -291,8 +354,17 @@ outbound_json() { # uses P_*, $1 = ssh socks port
         ws) s="$s,\"wsSettings\":{\"path\":$(js "${P_PATH:-/}"),\"host\":$(js "$P_HOST")}" ;;
         httpupgrade) s="$s,\"httpupgradeSettings\":{\"path\":$(js "${P_PATH:-/}"),\"host\":$(js "$P_HOST")}" ;;
     esac
-    printf '{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":%s,"port":%s,"users":[%s]}]},"streamSettings":{%s}}' \
-        "$(js "$P_ADDR")" "$P_PORT" "$u" "$s"
+    case $P_TYPE in
+        vmess)
+            printf '{"tag":"proxy","protocol":"vmess","settings":{"vnext":[{"address":%s,"port":%s,"users":[{"id":%s,"security":%s}]}]},"streamSettings":{%s}}' \
+                "$(js "$P_ADDR")" "$P_PORT" "$(js "$P_UUID")" "$(js "$P_ENC")" "$s" ;;
+        trojan)
+            printf '{"tag":"proxy","protocol":"trojan","settings":{"servers":[{"address":%s,"port":%s,"password":%s}]},"streamSettings":{%s}}' \
+                "$(js "$P_ADDR")" "$P_PORT" "$(js "$P_UUID")" "$s" ;;
+        *)
+            printf '{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":%s,"port":%s,"users":[%s]}]},"streamSettings":{%s}}' \
+                "$(js "$P_ADDR")" "$P_PORT" "$u" "$s" ;;
+    esac
 }
 # gen_xray NAME OUT [PROBE_PORT PROBE_SSH_PORT]
 gen_xray() {
@@ -484,7 +556,11 @@ cmd_start() {
     while [ $i -lt 10 ]; do is_running && break; sleep 1; i=$((i + 1)); done
     is_running && wait_ready
     if is_running; then ok "tunnel running: $ACTIVE"; else
-        err "tunnel did not start"; tail -n 5 "$RUN/test.out" 2>/dev/null >&2; tail -n 5 "$LOGD/xray.log" 2>/dev/null >&2; return 1
+        err "tunnel did not start - reason:"
+        { tail -n 3 "$LOGF"; grep -v '^$' "$RUN/test.out" | tail -n 6; tail -n 6 "$LOGD/xray.log"
+          logread -e xe-client 2>/dev/null | tail -n 6; } 2>/dev/null | sed 's/^/    /' >&2
+        say "full report: xec diag" >&2
+        return 1
     fi
 }
 cmd_stop() {
@@ -549,6 +625,26 @@ cmd_test() {
     else err "no answer through the tunnel (HTTP ${r%% *})"; return 1; fi
     t=$(env -u no_proxy -u NO_PROXY curl -s --max-time 15 -x "socks5h://127.0.0.1:$SOCKS_PORT" "$TRACE_URL" 2>/dev/null)
     [ -n "$t" ] && say "exit IP: $(printf '%s\n' "$t" | sed -n 's/^ip=//p')  country: $(printf '%s\n' "$t" | sed -n 's/^loc=//p')  Cloudflare: $(printf '%s\n' "$t" | sed -n 's/^colo=//p')"
+    return 0
+}
+# everything needed to see why the tunnel does not work (no secrets)
+cmd_diag() {
+    load_conf; lan_detect
+    say "== xec $XEC_VERSION | $(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_DESCRIPTION") | $(uname -m)"
+    say "== xray: $("$XRAY" version 2>&1 | head -n 1)"
+    say "== ssh : $(ssh_bin 2>/dev/null || echo 'OpenSSH missing')  sshpass: $(command -v sshpass || echo missing)"
+    say "== LAN : if=$LAN_IF ip=$LAN_IP  active=$ACTIVE route=$ROUTE"
+    say "== profiles:"; cmd_list
+    if [ -n "$ACTIVE" ] && prof_exists "$ACTIVE"; then
+        say "== config test ($ACTIVE):"
+        gen_xray "$ACTIVE" /tmp/xec-diag.json && "$XRAY" run -test -c /tmp/xec-diag.json 2>&1 | tail -n 4
+        rm -f /tmp/xec-diag.json
+    fi
+    say "== listening:"; netstat -ltnup 2>/dev/null | grep -E "xray|:($SOCKS_PORT|$REDIR_PORT|$DNS_PORT|$WEB_PORT) " | head -n 12
+    say "== processes:"; ps w | grep -E '[x]ray|[s]sh .*-D|[u]httpd.*xe-client' | cut -c1-150
+    say "== xec log:"; tail -n 15 "$LOGF" 2>/dev/null
+    say "== xray log:"; tail -n 15 "$LOGD/xray.log" 2>/dev/null
+    say "== system log:"; logread -e xe-client 2>/dev/null | tail -n 15
     return 0
 }
 cmd_ping() { for n in $(prof_list); do printf '%-16s ' "$n"; probe "$n"; done; }
@@ -661,7 +757,7 @@ cmd_list() {
         load_prof "$n" >/dev/null 2>&1 || continue
         mark=' '; [ "$n" = "$ACTIVE" ] && mark='*'
         if [ "$P_TYPE" = ssh ]; then d="ssh/$P_TRANS $P_USER@$P_ADDR:$P_PORT${P_SNI:+ sni=$P_SNI}"
-        else d="vless/$P_NET/$P_SEC $P_ADDR:$P_PORT${P_SNI:+ sni=$P_SNI}${P_FLOW:+ vision}${P_PQV:+ pq-sig}"; [ "$P_ENC" != none ] && d="$d pq-enc"; fi
+        else d="$P_TYPE/$P_NET/$P_SEC $P_ADDR:$P_PORT${P_SNI:+ sni=$P_SNI}${P_FLOW:+ vision}${P_PQV:+ pq-sig}"; [ "$P_TYPE" = vless ] && [ "$P_ENC" != none ] && d="$d pq-enc"; [ -n "$P_PCS" ] && d="$d pinned"; fi
         printf '%s %-16s %s %s\n' "$mark" "$n" "$d" "${P_REMARK:+($P_REMARK)}"
     done
 }
@@ -704,11 +800,11 @@ cmd_forget() { # NAME - forget the stored SSH host key
 }
 
 # --------------------------------------------------------------- settings
-SKEYS='ROUTE DNS_TUNNEL DNS_SERVER BLOCK_QUIC BLOCK_V6 KILLSWITCH FAILOVER SNIFF BYPASS_SRC BYPASS_DST LAN_IF LAN_IP SOCKS_PORT HTTP_PORT REDIR_PORT DNS_PORT API_PORT SSH_SOCKS WEB WEB_PORT LOGLEVEL CHECK_URL TRACE_URL'
+SKEYS='ROUTE DNS_TUNNEL DNS_SERVER BLOCK_QUIC BLOCK_V6 KILLSWITCH FAILOVER SNIFF BYPASS_SRC BYPASS_DST LAN_IF LAN_IP SOCKS_PORT HTTP_PORT REDIR_PORT DNS_PORT API_PORT SSH_SOCKS WEB WEB_PORT WEB_AUTH LOGLEVEL CHECK_URL TRACE_URL'
 valid_setting() { # KEY VALUE
     case $1 in
         ROUTE) match 'all|proxy' "$2" ;;
-        DNS_TUNNEL | BLOCK_QUIC | BLOCK_V6 | KILLSWITCH | FAILOVER | WEB | SNIFF) match '0|1' "$2" ;;
+        DNS_TUNNEL | BLOCK_QUIC | BLOCK_V6 | KILLSWITCH | FAILOVER | WEB | WEB_AUTH | SNIFF) match '0|1' "$2" ;;
         DNS_SERVER) match "$RE_IP4" "$2" ;;
         LAN_IP) [ -z "$2" ] || match "$RE_IP4" "$2" ;;
         LAN_IF) [ -z "$2" ] || match '[A-Za-z0-9._-]{1,15}' "$2" ;;
@@ -726,9 +822,10 @@ cmd_set() { # KEY VALUE
     valid_setting "$1" "$2" || die "bad value for $1: $2"
     conf_set "$CONF" "$1" "$2"
     ok "$1=$2"
+    if [ "$1" = WEB_AUTH ] && [ "$2" = 1 ] && [ ! -s "$ETC/web.pass" ]; then web_setpass; fi
     case $1 in WEB | WEB_PORT | LAN_IP) [ -x "$INIT_WEB" ] && restart "$INIT_WEB" ;; esac
     load_conf
-    is_running && case $1 in WEB | WEB_PORT | CHECK_URL | TRACE_URL | FAILOVER | KILLSWITCH) ;; *) restart "$INIT"; wait_ready ;; esac
+    is_running && case $1 in WEB | WEB_PORT | WEB_AUTH | CHECK_URL | TRACE_URL | FAILOVER | KILLSWITCH) ;; *) restart "$INIT"; wait_ready ;; esac
     return 0
 }
 cmd_bypass() { # add|del IP
@@ -778,8 +875,9 @@ cmd_web() {
         on) cmd_set WEB 1; "$INIT_WEB" enable ;;
         off) cmd_set WEB 0; "$INIT_WEB" stop; "$INIT_WEB" disable ;;
         password) web_setpass "${2:-}"; ok "web password changed" ;;
+        auth) case ${2:-} in on) cmd_set WEB_AUTH 1 ;; off) cmd_set WEB_AUTH 0 ;; *) die "usage: xec web auth on|off" ;; esac ;;
         url) say "http://$LAN_IP:$WEB_PORT/" ;;
-        *) die "usage: xec web on|off|url|password [NEW]" ;;
+        *) die "usage: xec web on|off|url|password [NEW]|auth on|off" ;;
     esac
 }
 
@@ -801,6 +899,20 @@ run_json() {
     t=$(sed 's/\x1b\[[0-9;]*m//g' "$out" | tail -n 80 | jtext); rm -f "$out"
     if [ $rc -eq 0 ]; then reply "{\"ok\":true,\"msg\":$t}"; else reply "{\"ok\":false,\"msg\":$t}"; fi
 }
+# DNS rebinding guard: only IP literals and the router's own names as Host
+cgi_host_ok() {
+    h=${HTTP_HOST:-}; h=${h%:*}
+    match "$RE_IP4" "$h" && return 0
+    case $h in
+        '' | localhost | console.gl-inet.com | "$(uci -q get system.@system[0].hostname)" | "$(uci -q get system.@system[0].hostname).lan") return 0 ;;
+    esac
+    return 1
+}
+# no-password mode: a fixed per-router CSRF token (a foreign web page cannot read it)
+cgi_noauth() {
+    [ -s "$ETC/web.csrf" ] || { rand_hex 16 >"$ETC/web.csrf"; chmod 600 "$ETC/web.csrf"; }
+    CSRF=$(cat "$ETC/web.csrf")
+}
 cgi_session() {
     tok=$(printf '%s' "${HTTP_COOKIE:-}" | tr ';' '\n' | sed -n 's/^ *xec_s=\([0-9a-f]\{32\}\)$/\1/p' | head -n 1)
     [ -n "$tok" ] && [ -f "$RUN/sess/$tok" ] || return 1
@@ -818,12 +930,12 @@ cgi_status() {
     for n in $(prof_list); do
         load_prof "$n" >/dev/null 2>&1 || continue
         haspw=false; [ -s "$PROF/$n.pass" ] && haspw=true
-        ps="$ps${ps:+,}{\"name\":$(js "$n"),\"type\":$(js "$P_TYPE"),\"addr\":$(js "$P_ADDR"),\"port\":$(js "$P_PORT"),\"sec\":$(js "$P_SEC"),\"net\":$(js "$P_NET"),\"sni\":$(js "$P_SNI"),\"flow\":$(js "$P_FLOW"),\"pq_sig\":$([ -n "$P_PQV" ] && echo true || echo false),\"pq_enc\":$([ -n "$P_ENC" ] && [ "$P_ENC" != none ] && echo true || echo false),\"trans\":$(js "$P_TRANS"),\"user\":$(js "$P_USER"),\"auth\":$(js "$P_AUTH"),\"wshost\":$(js "$P_WSHOST"),\"wspath\":$(js "$P_WSPATH"),\"payload\":$(js "$P_PAYLOAD"),\"haspw\":$haspw,\"remark\":$(js "$P_REMARK")}"
+        ps="$ps${ps:+,}{\"name\":$(js "$n"),\"type\":$(js "$P_TYPE"),\"addr\":$(js "$P_ADDR"),\"port\":$(js "$P_PORT"),\"sec\":$(js "$P_SEC"),\"net\":$(js "$P_NET"),\"sni\":$(js "$P_SNI"),\"flow\":$(js "$P_FLOW"),\"pq_sig\":$([ -n "$P_PQV" ] && echo true || echo false),\"pq_enc\":$([ "$P_TYPE" = vless ] && [ -n "$P_ENC" ] && [ "$P_ENC" != none ] && echo true || echo false),\"pinned\":$([ -n "$P_PCS" ] && echo true || echo false),\"trans\":$(js "$P_TRANS"),\"user\":$(js "$P_USER"),\"auth\":$(js "$P_AUTH"),\"wshost\":$(js "$P_WSHOST"),\"wspath\":$(js "$P_WSPATH"),\"payload\":$(js "$P_PAYLOAD"),\"haspw\":$haspw,\"remark\":$(js "$P_REMARK")}"
     done
     st=''
     for k in $SKEYS; do eval "v=\$$k"; st="$st${st:+,}\"$k\":$(js "$v")"; done
     pub=''; [ -f "$ETC/id_ed25519.pub" ] && pub=$(cat "$ETC/id_ed25519.pub")
-    reply "{\"ok\":true,\"version\":\"$XEC_VERSION\",\"xray\":$(js "$xv"),\"running\":$run,\"active\":$(js "$ACTIVE"),\"suspended\":$([ -f "$RUN/fw-suspended" ] && echo true || echo false),\"lan_ip\":$(js "$LAN_IP"),\"lan_if\":$(js "$LAN_IF"),\"up\":$up,\"down\":$down,\"uptime\":$(js "$(uptime | sed 's/.*up *//;s/, *load.*//')"),\"sshkey\":$(js "$pub"),\"profiles\":[$ps],\"settings\":{$st}}"
+    reply "{\"ok\":true,\"auth\":$([ "$WEB_AUTH" = 1 ] && echo true || echo false),\"version\":\"$XEC_VERSION\",\"xray\":$(js "$xv"),\"running\":$run,\"active\":$(js "$ACTIVE"),\"suspended\":$([ -f "$RUN/fw-suspended" ] && echo true || echo false),\"lan_ip\":$(js "$LAN_IP"),\"lan_if\":$(js "$LAN_IF"),\"up\":$up,\"down\":$down,\"uptime\":$(js "$(uptime | sed 's/.*up *//;s/, *load.*//')"),\"sshkey\":$(js "$pub"),\"profiles\":[$ps],\"settings\":{$st}}"
 }
 cgi_exitinfo() {
     load_conf
@@ -857,7 +969,11 @@ cmd_cgi() {
         FORM=$(head -c "$len")
     fi
     a=$(fv a)
-    if [ "$a" = login ]; then
+    cgi_host_ok || { printf 'Status: 403 Forbidden\r\nContent-Type: application/json\r\n\r\n{"ok":false,"msg":"bad Host - open the panel by the router IP"}\n'; exit 0; }
+    if [ "$WEB_AUTH" != 1 ]; then
+        cgi_noauth
+        [ "$a" = login ] && reply "{\"ok\":true,\"csrf\":$(js "$CSRF")}"
+    elif [ "$a" = login ]; then
         [ "${REQUEST_METHOD:-}" = POST ] || reply_err "POST only"
         f=$(cat "$RUN/web-fails" 2>/dev/null || echo 0)
         if [ "$f" -ge 5 ] && [ -n "$(find "$RUN/web-fails" -mmin -5 2>/dev/null)" ]; then reply_err "too many attempts - wait 5 minutes"; fi
@@ -874,7 +990,7 @@ cmd_cgi() {
         log "web: bad password from ${REMOTE_ADDR:-?}"
         reply_err "wrong password"
     fi
-    cgi_session || { printf 'Status: 401 Unauthorized\r\nContent-Type: application/json\r\n\r\n{"ok":false,"auth":false}\n'; exit 0; }
+    [ "$WEB_AUTH" != 1 ] || cgi_session || { printf 'Status: 401 Unauthorized\r\nContent-Type: application/json\r\n\r\n{"ok":false,"auth":false}\n'; exit 0; }
     if [ "${REQUEST_METHOD:-}" = POST ]; then
         [ "$(fv csrf)" = "$CSRF" ] || reply_err "bad CSRF token - reload the page"
     elif [ "$a" != status ] && [ "$a" != logs ] && [ "$a" != csrf ] && [ "$a" != export ]; then
@@ -910,7 +1026,7 @@ cmd_cgi() {
             web_check "$(fv old)" || reply_err "current password is wrong"
             n=$(fv new); [ ${#n} -ge 6 ] || reply_err "new password: 6 characters or more"
             run_json web_setpass "$n" ;;
-        logout) rm -f "$RUN/sess/$tok"; reply '{"ok":true}' ;;
+        logout) [ -n "${tok:-}" ] && rm -f "$RUN/sess/$tok"; reply '{"ok":true}' ;;
         *) reply_err "unknown action" ;;
     esac
 }
@@ -1073,10 +1189,10 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
  <table><thead><tr><th>الاسم</th><th>النوع</th><th>الخادم</th><th></th></tr></thead><tbody id="pl"></tbody></table><br>
  <button class="btn sec" data-a="ping">اختبار كل الخوادم</button></div></section>
 <section id="t-ad" class="hide">
- <div class="card"><h3>VLESS REALITY (رابط)</h3>
+ <div class="card"><h3>رابط VLESS / VMess / Trojan / SSH</h3>
   <p class="mut">الصق رابطاً أو عدة روابط (سطر لكل رابط): <code>vless://…security=reality&amp;sni=…&amp;pbk=…&amp;sid=…&amp;flow=xtls-rprx-vision</code> — يدعم pqv (ML-DSA-65) و encryption=mlkem768x25519plus و XHTTP و gRPC. يقبل أيضاً <code>ssh://user:pass@host:443?transport=tls&amp;sni=…</code></p>
   <label>الاسم (اختياري لرابط واحد)</label><input id="a-name" placeholder="myserver">
-  <label>الرابط / الروابط</label><textarea id="a-link" placeholder="vless://"></textarea><br><br>
+  <label>الرابط / الروابط</label><textarea id="a-link" placeholder="vless://  vmess://  trojan://  ssh://"></textarea><br><br>
   <button class="btn" id="a-go">حفظ</button></div>
  <div class="card"><h3>خادم SSH</h3>
   <div class="row"><div><label>الاسم</label><input id="h-name" placeholder="ssh1"></div><div><label>ملاحظة</label><input id="h-remark"></div></div>
@@ -1097,6 +1213,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
  <div class="tog"><div>حظر IPv6 للأجهزة<small>يمنع خروج IPv6 خارج النفق</small></div><input type="checkbox" id="c-BLOCK_V6"></div>
  <div class="tog"><div>مفتاح القطع (Kill switch)<small>لا إنترنت إن انقطع النفق</small></div><input type="checkbox" id="c-KILLSWITCH"></div>
  <div class="tog"><div>التبديل التلقائي<small>ينتقل لخادم آخر يعمل عند الانقطاع</small></div><input type="checkbox" id="c-FAILOVER"></div>
+ <div class="tog"><div>طلب كلمة مرور لفتح اللوحة<small>عند التفعيل تظهر كلمة المرور مرة واحدة</small></div><input type="checkbox" id="c-WEB_AUTH"></div>
  <div class="tog"><div>Sniffing (اسم الموقع)<small>يرسل اسم الموقع للخادم بدل IP</small></div><input type="checkbox" id="c-SNIFF"></div>
  <div class="row"><div><label>خادم DNS</label><input id="v-DNS_SERVER"></div><div><label>مستوى السجل</label><select id="v-LOGLEVEL"><option>none</option><option>error</option><option>warning</option><option>info</option><option>debug</option></select></div></div>
  <label>أجهزة خارج النفق (IP مفصولة بمسافة)</label><input id="v-BYPASS_SRC" placeholder="192.168.8.50 192.168.8.51">
@@ -1107,7 +1224,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
  <div class="card"><h3>الأدوات</h3>
   <button class="btn" data-a="test">اختبار النفق</button><button class="btn sec" data-a="update">تحديث Xray</button><button class="btn sec" data-a="watchdog">تشغيل المراقب الآن</button><button class="btn sec" id="lg">السجلات</button><a class="btn sec" href="cgi-bin/api?a=export" style="text-decoration:none;display:inline-block"><button class="btn sec" type="button">تصدير نسخة احتياطية</button></a>
   <pre id="out" class="hide"></pre></div>
- <div class="card"><h3>كلمة مرور اللوحة</h3><div class="row"><div><label>الحالية</label><input id="p-old" type="password"></div><div><label>الجديدة (6+)</label><input id="p-new" type="password"></div></div><br><button class="btn" id="p-go">تغيير</button></div>
+ <div class="card" id="pw-card"><h3>كلمة مرور اللوحة</h3><div class="row"><div><label>الحالية</label><input id="p-old" type="password"></div><div><label>الجديدة (6+)</label><input id="p-new" type="password"></div></div><br><button class="btn" id="p-go">تغيير</button></div>
 </section>
 </main></div>
 <div id="toast"></div>
@@ -1130,8 +1247,8 @@ $("lo").onclick=function(){api("logout",{}).then(function(){location.reload()})}
 function start(){$("login").classList.add("hide");$("app").classList.remove("hide");load();clearInterval(timer);timer=setInterval(function(){if(tab=="st")load()},5000)}
 document.querySelectorAll("#nav button").forEach(function(b){b.onclick=function(){tab=b.dataset.t;document.querySelectorAll("#nav button").forEach(function(x){x.classList.toggle("on",x==b)});document.querySelectorAll("main>section").forEach(function(s){s.classList.toggle("hide",s.id!="t-"+tab)});if(tab=="se")fillSettings()}});
 document.querySelectorAll("[data-a]").forEach(function(b){b.onclick=function(){act(b.dataset.a,{},b).then(function(j){if(j&&["test","update","watchdog","ping"].indexOf(b.dataset.a)>=0){$("out").textContent=j.msg;$("out").classList.remove("hide")}})}});
-function kind(p){if(p.type=="ssh")return'<span class="chip">SSH</span><span class="chip">'+esc(p.trans)+'</span>';var h='<span class="chip">VLESS</span><span class="chip">'+esc(p.net)+'</span><span class="chip">'+esc(p.sec)+'</span>';if(p.flow)h+='<span class="chip">Vision</span>';if(p.pq_sig)h+='<span class="chip">PQ-sig</span>';if(p.pq_enc)h+='<span class="chip">PQ-enc</span>';return h}
-function load(){api("status").then(function(j){S=j;
+function kind(p){if(p.type=="ssh")return'<span class="chip">SSH</span><span class="chip">'+esc(p.trans)+'</span>';var h='<span class="chip">'+esc(String(p.type).toUpperCase())+'</span><span class="chip">'+esc(p.net)+'</span><span class="chip">'+esc(p.sec)+'</span>';if(p.flow)h+='<span class="chip">Vision</span>';if(p.pq_sig)h+='<span class="chip">PQ-sig</span>';if(p.pq_enc)h+='<span class="chip">PQ-enc</span>';if(p.pinned)h+='<span class="chip">pinned</span>';return h}
+function load(){api("status").then(function(j){S=j;$("lo").classList.toggle("hide",!j.auth);$("pw-card").classList.toggle("hide",!j.auth);
   $("hb").className="badge "+(j.running?(j.suspended?"y":"g"):"r");$("hb").textContent=j.running?(j.suspended?"النفق متوقف مؤقتاً":"متصل"):"متوقف";
   $("s-run").innerHTML=j.running?'<span class="badge g">يعمل</span>':'<span class="badge r">متوقف</span>';
   $("s-act").textContent=j.active||"-";$("s-up").textContent=hb(j.up);$("s-dn").textContent=hb(j.down);$("s-xv").textContent=j.xray||"-";
@@ -1151,7 +1268,7 @@ $("h-trans").onchange=sshFields;$("h-auth").onchange=sshFields;sshFields();
 function editSsh(n){var p=S.profiles.filter(function(x){return x.name==n})[0];if(!p)return;$("h-name").value=p.name;$("h-remark").value=p.remark;$("h-host").value=p.addr;$("h-port").value=p.port;$("h-user").value=p.user;$("h-auth").value=p.auth||"pass";$("h-trans").value=p.trans||"direct";$("h-sni").value=p.sni;$("h-wshost").value=p.wshost;$("h-wspath").value=p.wspath;$("h-payload").value=p.payload;$("h-pass").value="";sshFields();document.querySelector('#nav [data-t="ad"]').click()}
 $("h-go").onclick=function(){var d={name:$("h-name").value.trim(),remark:$("h-remark").value.trim(),host:$("h-host").value.trim(),port:$("h-port").value.trim(),user:$("h-user").value.trim(),auth:$("h-auth").value,pass:$("h-pass").value,trans:$("h-trans").value,sni:$("h-sni").value.trim(),wshost:$("h-wshost").value.trim(),wspath:$("h-wspath").value.trim(),payload:$("h-payload").value.replace(/\r?\n/g,"[crlf]")};
   act("addssh",d,this).then(function(j){if(j&&j.ok){$("h-pass").value="";if(d.auth=="key")api("sshkey",{}).then(function(k){$("h-keyv").textContent=k.msg;$("h-key").classList.remove("hide")})}})};
-var TOG=["DNS_TUNNEL","BLOCK_QUIC","BLOCK_V6","KILLSWITCH","FAILOVER","SNIFF"],VAL=["DNS_SERVER","LOGLEVEL","BYPASS_SRC","BYPASS_DST","CHECK_URL"];
+var TOG=["DNS_TUNNEL","BLOCK_QUIC","BLOCK_V6","KILLSWITCH","FAILOVER","SNIFF","WEB_AUTH"],VAL=["DNS_SERVER","LOGLEVEL","BYPASS_SRC","BYPASS_DST","CHECK_URL"];
 function fillSettings(){if(!S)return;var s=S.settings;$("c-ROUTE").checked=s.ROUTE=="all";TOG.forEach(function(k){$("c-"+k).checked=s[k]=="1"});VAL.forEach(function(k){$("v-"+k).value=s[k]})}
 $("se-go").onclick=function(){var s=S.settings,ch=[],b=this;var r=$("c-ROUTE").checked?"all":"proxy";if(r!=s.ROUTE)ch.push(["ROUTE",r]);
   TOG.forEach(function(k){var v=$("c-"+k).checked?"1":"0";if(v!=s[k])ch.push([k,v])});VAL.forEach(function(k){var v=$("v-"+k).value.trim();if(v!=s[k])ch.push([k,v])});
@@ -1291,9 +1408,8 @@ cmd_install() {
     [ -f "$CONF" ] || { : >"$CONF"; chmod 600 "$CONF"; }
     load_conf; lan_detect
     [ $web = 1 ] || conf_set "$CONF" WEB 0
-    genpw=''
-    if [ -n "${WEBPW:-}" ]; then web_setpass "$WEBPW" >/dev/null
-    elif [ ! -s "$ETC/web.pass" ]; then genpw=$(web_setpass | sed -n 's/^web password: //p'); fi
+    # the web panel has no password (LAN only) unless --web-password is given
+    [ -n "${WEBPW:-}" ] && { web_setpass "$WEBPW" >/dev/null; conf_set "$CONF" WEB_AUTH 1; }
     "$INIT_WEB" enable; restart "$INIT_WEB"
     /etc/init.d/firewall reload >/dev/null 2>&1
     [ -n "$link" ] && "$SELF" add "$link"
@@ -1301,8 +1417,8 @@ cmd_install() {
     if [ -n "$ACTIVE" ] && { [ $was = 1 ] || [ -n "$link" ]; }; then "$SELF" start; fi
     say ""
     ok "installed. menu: menu1   commands: xec help"
-    [ $web = 1 ] && say "web panel : http://$LAN_IP:$WEB_PORT/"
-    [ -n "$genpw" ] && say "password  : $genpw   (shown once - change: xec web password)"
+    load_conf; lan_detect
+    [ $web = 1 ] && say "web panel : http://$LAN_IP:$WEB_PORT/  $([ "$WEB_AUTH" = 1 ] && echo '(password)' || echo '(no password, LAN only - xec web auth on to add one)')"
     [ -n "$ACTIVE" ] || say "next      : xec add NAME 'vless://...'   then   xec start"
     return 0
 }
@@ -1339,32 +1455,44 @@ cmd_status() {
     if is_running; then set -- $(cmd_stats); say "traffic: up $(human "$1")  down $(human "$2")"; fi
     say "profiles:"; cmd_list
 }
+# menu_ssh [TRANSPORT] - interactive SSH profile (wss = WebSocket + TLS with SNI)
+menu_ssh() {
+    ask "name: " || return 0; n=$REPLY; ask "server host/IP: " || return 0; h=$REPLY
+    t=$1
+    if [ -z "$t" ]; then ask "transport direct|tls|ws|wss [direct]: " || return 0; t=${REPLY:-direct}; fi
+    dp=22; case $t in tls | wss) dp=443 ;; ws) dp=80 ;; esac
+    ask "port [$dp]: " || return 0; p=${REPLY:-$dp}; ask "user: " || return 0; u=$REPLY
+    s='' wh='' wp=''
+    case $t in tls | wss) ask "SNI (bug host) [$h]: " || return 0; s=$REPLY ;; esac
+    case $t in ws | wss) ask "WebSocket Host header [${s:-$h}]: " || return 0; wh=$REPLY
+        ask "WebSocket path [/]: " || return 0; wp=$REPLY ;; esac
+    ask "password (empty = use SSH key): " || return 0
+    set -- "$n" --host "$h" --port "$p" --user "$u" --transport "$t"
+    [ -n "$s" ] && set -- "$@" --sni "$s"; [ -n "$wh" ] && set -- "$@" --ws-host "$wh"; [ -n "$wp" ] && set -- "$@" --ws-path "$wp"
+    if [ -n "$REPLY" ]; then printf '%s\n' "$REPLY" | (cmd_add_ssh "$@" --pass-stdin); else (cmd_add_ssh "$@" --key) && ssh_key; fi
+    return 0
+}
 cmd_menu() {
     while true; do
         say ""
         say "=========== XE3000 CLIENT $XEC_VERSION ==========="
         cmd_status
         say "---------------------------------------------"
-        say " 1) add VLESS REALITY link      2) add SSH server"
+        say " 1) add link: VLESS / VMess / Trojan / SSH"
+        say " 2) add SSH server (direct / TLS / WS / WSS)"
+        say "13) add SSH WSS (WebSocket + TLS + SNI)"
         say " 3) choose active profile       4) test all profiles"
         say " 5) start / restart tunnel      6) stop tunnel"
         say " 7) test tunnel + exit IP       8) settings"
-        say " 9) web panel password         10) update Xray"
+        say " 9) web panel password on/off  10) update Xray"
         say "11) show logs                  12) SSH public key"
         say " 0) exit"
         ask "choice: " || return 0
         case $REPLY in
-            1) ask "name (empty = auto): " || return 0; n=$REPLY; ask "link (vless://...): " || return 0
+            1) ask "name (empty = auto): " || return 0; n=$REPLY; ask "link (vless:// vmess:// trojan:// ssh://): " || return 0
                if [ -n "$n" ]; then (cmd_add "$n" "$REPLY"); else (cmd_add "$REPLY"); fi ;;
-            2) ask "name: " || return 0; n=$REPLY; ask "server host/IP: " || return 0; h=$REPLY
-               ask "port [22, 443 for TLS]: " || return 0; p=${REPLY:-22}; ask "user: " || return 0; u=$REPLY
-               ask "transport direct|tls|ws|wss [direct]: " || return 0; t=${REPLY:-direct}; s=''; wh=''
-               case $t in tls | wss) ask "SNI (bug host) [$h]: " || return 0; s=$REPLY ;; esac
-               case $t in ws | wss) ask "WebSocket Host header [$h]: " || return 0; wh=$REPLY ;; esac
-               ask "password (empty = use SSH key): " || return 0
-               set -- "$n" --host "$h" --port "$p" --user "$u" --transport "$t"
-               [ -n "$s" ] && set -- "$@" --sni "$s"; [ -n "$wh" ] && set -- "$@" --ws-host "$wh"
-               if [ -n "$REPLY" ]; then printf '%s\n' "$REPLY" | (cmd_add_ssh "$@" --pass-stdin); else (cmd_add_ssh "$@" --key) && ssh_key; fi ;;
+            2) menu_ssh '' ;;
+            13) menu_ssh wss ;;
             3) cmd_list; ask "profile name: " || return 0; (cmd_use "$REPLY") ;;
             4) cmd_ping ;;
             5) (cmd_start) ;;
@@ -1372,7 +1500,14 @@ cmd_menu() {
             7) (cmd_test) ;;
             8) cmd_set; ask "KEY VALUE (empty = back): " || return 0
                [ -n "$REPLY" ] && (cmd_set ${REPLY%% *} "${REPLY#* }") ;;
-            9) ask "new password (empty = random): " || return 0; (web_setpass "$REPLY") ;;
+            9) load_conf
+               if [ "$WEB_AUTH" = 1 ]; then
+                   ask "panel password is ON. o = turn off, p = new password, empty = back: " || return 0
+                   case $REPLY in o) (cmd_set WEB_AUTH 0) ;; p) ask "new password (empty = random): " || return 0; (web_setpass "$REPLY") ;; esac
+               else
+                   ask "panel has NO password. y = add a password: " || return 0
+                   [ "$REPLY" = y ] && { ask "password (empty = random): " || return 0; (web_setpass "$REPLY"; cmd_set WEB_AUTH 1); }
+               fi ;;
             10) (cmd_update_xray) ;;
             11) tail -n 30 "$LOGF" 2>/dev/null; tail -n 15 "$LOGD/xray.log" 2>/dev/null ;;
             12) (ssh_key) ;;
@@ -1389,16 +1524,17 @@ XE3000 CLIENT $XEC_VERSION - router -> your server (VLESS REALITY / SSH)
   sh xe3000-client.sh install [--link URL] [--no-web] [--no-ssh] [--web-password P]
                                 [--xray-version vX.Y.Z | --xray-zip F --xray-dgst F]
   menu1  (or: xec menu)      interactive menu
-  xec status | start | stop | restart | test [NAME] | ping
+  xec status | start | stop | restart | test [NAME] | ping | diag
   xec add [NAME] 'vless://UUID@HOST:443?security=reality&sni=...&pbk=...&sid=...&flow=xtls-rprx-vision&fp=chrome[&pqv=...]'
-  xec add [NAME] 'ssh://USER:PASS@HOST:443?transport=tls&sni=BUGHOST'
+  xec add [NAME] 'vmess://BASE64-JSON'   'trojan://PASSWORD@HOST:443?security=tls&sni=...[&type=ws&path=/..][&pcs=CERT_SHA256]'
+  xec add [NAME] 'ssh://USER:PASS@HOST:443?transport=tls|ws|wss&sni=BUGHOST[&host=WSHOST&path=/]'
   xec add-ssh NAME --host H --user U [--port 22] [--pass P | --pass-stdin | --key]
               [--transport direct|tls|ws|wss] [--sni S] [--ws-host H] [--ws-path /] [--payload STR]
   xec import < links.txt     xec list | use NAME | del NAME | show NAME
   xec ssh-key                xec forget NAME (reset SSH host key)
   xec set [KEY VALUE]        ROUTE all|proxy, DNS_TUNNEL, BLOCK_QUIC, BLOCK_V6, KILLSWITCH, FAILOVER 0|1 ...
   xec route on|off           xec bypass add|del LAN_IP
-  xec web on|off|url|password [NEW]
+  xec web on|off|url|password [NEW]|auth on|off   (default: no password, LAN only)
   xec stats | logs | update-xray | export > file | restore FILE | uninstall [--purge]
 EOF
 }
@@ -1421,6 +1557,7 @@ case $cmd in
     status) cmd_status ;;
     test) cmd_test "$@" ;;
     ping) cmd_ping ;;
+    diag) cmd_diag ;;
     set) cmd_set "$@" ;;
     route) cmd_route "$@" ;;
     bypass) cmd_bypass "$@" ;;

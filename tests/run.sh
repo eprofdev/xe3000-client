@@ -112,7 +112,14 @@ cat >"$W/server.json" <<EOF
 {"tag":"C","listen":"198.51.100.20","port":3443,"protocol":"vless","settings":{"clients":[{"id":"$UUID","flow":"xtls-rprx-vision"}],"decryption":"$DEC"},
  "streamSettings":{"network":"raw","security":"none"}},
 {"tag":"D","listen":"198.51.100.20","port":4443,"protocol":"vless","settings":{"clients":[{"id":"$UUID"}],"decryption":"none"},
- "streamSettings":{"network":"xhttp","xhttpSettings":{"path":"/xh"},"security":"reality","realitySettings":{"target":"127.0.0.1:19443","serverNames":["www.example.com"],"privateKey":"$PK","shortIds":["a1b2c3d4"]}}}],
+ "streamSettings":{"network":"xhttp","xhttpSettings":{"path":"/xh"},"security":"reality","realitySettings":{"target":"127.0.0.1:19443","serverNames":["www.example.com"],"privateKey":"$PK","shortIds":["a1b2c3d4"]}}},
+{"tag":"E","listen":"198.51.100.20","port":6443,"protocol":"vmess","settings":{"clients":[{"id":"$UUID"}]},
+ "streamSettings":{"network":"ws","wsSettings":{"path":"/vm"},"security":"tls","tlsSettings":{"certificates":[{"certificateFile":"$W/www.crt","keyFile":"$W/www.key"}]}}},
+{"tag":"F","listen":"198.51.100.20","port":6444,"protocol":"vmess","settings":{"clients":[{"id":"$UUID"}]},"streamSettings":{"network":"raw","security":"none"}},
+{"tag":"G","listen":"198.51.100.20","port":7443,"protocol":"trojan","settings":{"clients":[{"password":"Tr0jan-pass"}]},
+ "streamSettings":{"network":"raw","security":"tls","tlsSettings":{"certificates":[{"certificateFile":"$W/www.crt","keyFile":"$W/www.key"}]}}},
+{"tag":"H","listen":"198.51.100.20","port":7444,"protocol":"trojan","settings":{"clients":[{"password":"Tr0jan-pass"}]},
+ "streamSettings":{"network":"ws","wsSettings":{"path":"/tj"},"security":"tls","tlsSettings":{"certificates":[{"certificateFile":"$W/www.crt","keyFile":"$W/www.key"}]}}}],
 "outbounds":[{"protocol":"freedom","settings":{"finalRules":[{"action":"allow","ip":["203.0.113.0/24"]}]}}]}
 EOF
 t "server config valid" "$XRAY_HOST" run -test -c "$W/server.json"
@@ -136,6 +143,16 @@ LINK_A="vless://$UUID@198.51.100.20:443?encryption=none&flow=xtls-rprx-vision&se
 LINK_B="vless://$UUID@198.51.100.20:2443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.example.com&fp=chrome&pbk=$PBK&sid=a1b2c3d4&pqv=$VERIFY&type=tcp#PQ%20signature"
 LINK_C="vless://$UUID@198.51.100.20:3443?encryption=$ENC&flow=xtls-rprx-vision&security=none&type=tcp#VLESS%20Encryption"
 LINK_D="vless://$UUID@198.51.100.20:4443?encryption=none&security=reality&sni=www.example.com&fp=chrome&pbk=$PBK&sid=a1b2c3d4&type=xhttp&path=%2Fxh&mode=auto#XHTTP%20REALITY"
+# VMess / Trojan over TLS: the test certificate is not from a public CA, so the
+# client pins it (pcs = SHA-256 of the certificate, Xray's replacement for allowInsecure)
+PCS=$(openssl x509 -in "$W/www.crt" -outform der | sha256sum | cut -d' ' -f1)
+vmess_link() { printf 'vmess://%s' "$(printf '%s' "$1" | base64 -w0)"; }
+LINK_VMWS=$(vmess_link "{\"v\":\"2\",\"ps\":\"VMess WS TLS\",\"add\":\"198.51.100.20\",\"port\":\"6443\",\"id\":\"$UUID\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"www.example.com\",\"path\":\"/vm\",\"tls\":\"tls\",\"sni\":\"www.example.com\",\"fp\":\"chrome\",\"pcs\":\"$PCS\"}")
+LINK_VMTCP=$(vmess_link "{\"v\":\"2\",\"ps\":\"سيرفر VMess\",\"add\":\"198.51.100.20\",\"port\":6444,\"id\":\"$UUID\",\"aid\":0,\"scy\":\"chacha20-poly1305\",\"net\":\"tcp\",\"type\":\"none\",\"tls\":\"\"}")
+LINK_VMBADPIN=$(vmess_link "{\"v\":\"2\",\"ps\":\"badpin\",\"add\":\"198.51.100.20\",\"port\":\"6443\",\"id\":\"$UUID\",\"net\":\"ws\",\"path\":\"/vm\",\"tls\":\"tls\",\"sni\":\"www.example.com\",\"pcs\":\"$(printf '%064d' 7)\"}")
+LINK_TJ="trojan://Tr0jan-pass@198.51.100.20:7443?security=tls&sni=www.example.com&fp=chrome&pcs=$PCS&type=tcp#Trojan%20TLS"
+LINK_TJWS="trojan://Tr0jan-pass@198.51.100.20:7444?security=tls&sni=www.example.com&type=ws&path=%2Ftj&host=www.example.com&pcs=$PCS#Trojan%20WS"
+LINK_TJBAD="trojan://wrong-pass@198.51.100.20:7443?security=tls&sni=www.example.com&pcs=$PCS#tjbad"
 LINK_BADSNI="vless://$UUID@198.51.100.20:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=not-allowed.example.net&fp=chrome&pbk=$PBK&sid=a1b2c3d4&type=tcp"
 LINK_BADPQ="vless://$UUID@198.51.100.20:2443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.example.com&fp=chrome&pbk=$PBK&sid=a1b2c3d4&pqv=$VERIFY2&type=tcp"
 
@@ -240,6 +257,23 @@ done
 r=$(X xec test badsni); echo "    | $r"; case $r in *FAIL*) pass "wrong SNI is refused by the server" ;; *) fail "wrong SNI worked" ;; esac
 r=$(X xec test badpq); echo "    | $r"; case $r in *FAIL*) pass "wrong ML-DSA-65 key (pqv) is detected" ;; *) fail "wrong pqv worked" ;; esac
 
+step "profiles: VMess + Trojan"
+X xec add vmws "$LINK_VMWS" | sed 's/^/    | /'
+X xec add "$LINK_VMTCP" | sed 's/^/    | /'
+X xec add vmbadpin "$LINK_VMBADPIN" >/dev/null
+X xec add tj "$LINK_TJ" | sed 's/^/    | /'
+X xec add tjws "$LINK_TJWS" | sed 's/^/    | /'
+X xec add tjbad "$LINK_TJBAD" >/dev/null
+VMTCP=$(X sh -c 'grep -l "P_PORT=.6444" /etc/xe-client/profiles/*.conf' | head -n 1); VMTCP=$(basename "$VMTCP" .conf)
+t "vmess:// base64 JSON parsed (Arabic remark kept)" X grep -q "P_REMARK='سيرفر VMess'" "/etc/xe-client/profiles/$VMTCP.conf"
+for p in vmws "$VMTCP" tj tjws; do
+    r=$(X xec test "$p"); echo "    | $r"
+    case $p in vmws) d="VMess + WebSocket + TLS (pinned certificate)" ;; tj) d="Trojan + TLS" ;; tjws) d="Trojan + WebSocket + TLS" ;; *) d="VMess TCP (chacha20-poly1305)" ;; esac
+    case $r in *OK*) pass "$d" ;; *) fail "$d" ;; esac
+done
+r=$(X xec test tjbad); echo "    | $r"; case $r in *FAIL*) pass "wrong Trojan password fails" ;; *) fail "wrong Trojan password worked" ;; esac
+r=$(X xec test vmbadpin); echo "    | $r"; case $r in *FAIL*) pass "wrong certificate pin (pcs) is refused" ;; *) fail "wrong pcs worked" ;; esac
+
 step "profiles: SSH (direct / TLS+SNI / WebSocket / WebSocket+TLS / key)"
 X xec add-ssh sdirect --host 198.51.100.30 --port 2222 --user xectest --pass 'Pa55-w0rd' | sed 's/^/    | /'
 X xec add stls 'ssh://xectest:Pa55-w0rd@198.51.100.30:443?transport=tls&sni=bug.example.com#SSH%20TLS' | sed 's/^/    | /'
@@ -299,7 +333,7 @@ t "wrong password refused" sh -c "ip netns exec xeclan env -u HTTP_PROXY -u http
 CS=$(api -d 'a=login&pass=Web-pass-123' http://192.168.8.1:8899/cgi-bin/api | python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf"])')
 t "login -> session + CSRF token" test ${#CS} = 32
 api "http://192.168.8.1:8899/cgi-bin/api?a=status" >"$W/status.json"
-t "status JSON valid, running, 11 profiles" python3 -c "import json; j=json.load(open('$W/status.json')); assert j['running'] and j['active']=='A' and len(j['profiles'])==11, j"
+t "status JSON valid, running, 17 profiles" python3 -c "import json; j=json.load(open('$W/status.json')); assert j['running'] and j['active']=='A' and len(j['profiles'])==17, j"
 t "status never contains passwords" sh -c "! grep -q 'Pa55-w0rd' '$W/status.json'"
 t "POST without CSRF refused" sh -c "ip netns exec xeclan env -u HTTP_PROXY -u http_proxy curl -s -b '$J' -d 'a=set&key=LOGLEVEL&value=info' http://192.168.8.1:8899/cgi-bin/api | grep -q 'CSRF'"
 r=$(api -d "a=set&key=LOGLEVEL&value=info&csrf=$CS" http://192.168.8.1:8899/cgi-bin/api); echo "    | $r"
@@ -323,6 +357,20 @@ t "logout ends the session" test "$code" = 401
 for i in 1 2 3 4 5; do C curl -s -d 'a=login&pass=bad' http://192.168.8.1:8899/cgi-bin/api >/dev/null; done
 t "brute force lock after 5 wrong passwords" sh -c "ip netns exec xeclan env -u HTTP_PROXY -u http_proxy curl -s -d 'a=login&pass=Web-pass-123' http://192.168.8.1:8899/cgi-bin/api | grep -q 'too many'"
 X rm -f /var/run/xe-client/web-fails
+
+step "web panel without password (default)"
+X xec web auth off | sed 's/^/    | /'
+code=$(C curl -s -o "$W/na.json" -w '%{http_code}' "http://192.168.8.1:8899/cgi-bin/api?a=status")
+t "no password: status opens without login" sh -c "[ $code = 200 ] && grep -q '\"auth\":false' '$W/na.json'"
+t "no password: POST without CSRF still refused" sh -c "ip netns exec xeclan env -u HTTP_PROXY -u http_proxy curl -s -d 'a=set&key=LOGLEVEL&value=warning' http://192.168.8.1:8899/cgi-bin/api | grep -q CSRF"
+NCS=$(C curl -s "http://192.168.8.1:8899/cgi-bin/api?a=csrf" | python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf"])')
+r=$(C curl -s -d "a=set&key=LOGLEVEL&value=warning&csrf=$NCS" http://192.168.8.1:8899/cgi-bin/api); echo "    | $r"
+t "no password: change a setting with the page token" X grep -q "^LOGLEVEL='warning'" /etc/xe-client/client.conf
+code=$(C curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example.com' "http://192.168.8.1:8899/cgi-bin/api?a=status")
+t "foreign Host refused (DNS rebinding)" test "$code" = 403
+X xec web auth on >/dev/null
+code=$(C curl -s -o /dev/null -w '%{http_code}' "http://192.168.8.1:8899/cgi-bin/api?a=status")
+t "password turned back on -> 401" test "$code" = 401
 
 step "whole LAN through SSH over WebSocket + TLS (SNI)"
 X xec use swss | sed 's/^/    | /'
