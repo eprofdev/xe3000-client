@@ -148,6 +148,10 @@ load_prof() {
     prof_exists "$1" || { err "profile not found: $1"; return 1; }
     . "$PROF/$1.conf"
     P_NAME=$1
+    # SNI scanner: try a host without saving it (set only in scan sub-processes)
+    [ -n "${XEC_OV_SNI:-}" ] && P_SNI=$XEC_OV_SNI
+    [ -n "${XEC_OV_ADDR:-}" ] && P_ADDR=$XEC_OV_ADDR
+    return 0
 }
 save_prof() { # NAME (writes all P_*)
     mkdir -p "$PROF"; chmod 700 "$ETC" "$PROF" 2>/dev/null
@@ -322,6 +326,12 @@ name_from() { # suggestion from remark
     printf '%s' "$n"
 }
 
+# pick_name GIVEN FALLBACK - a usable profile name: GIVEN if valid, else built from
+# GIVEN (spaces, Arabic, too long ...) or from FALLBACK (the server address)
+pick_name() {
+    if match "$RE_NAME" "$1"; then printf '%s' "$1"; return; fi
+    if [ -n "$(printf '%s' "$1" | tr -cd 'A-Za-z0-9')" ]; then name_from "$1"; else name_from "$2"; fi
+}
 # ------------------------------------------------------------ xray config
 outbound_json() { # uses P_*, $1 = ssh socks port
     if [ "$P_TYPE" = ssh ]; then
@@ -648,6 +658,130 @@ cmd_test() {
     return 0
 }
 # everything needed to see why the tunnel does not work (no secrets)
+# ------------------------------------------------------------- SNI hosts
+# $ETC/sni-hosts.txt   one host per line (the list to scan)
+# $ETC/sni-results.txt HOST<TAB>MODE<TAB>OK|FAIL<TAB>MS<TAB>DETAIL<TAB>PROFILE (last scan)
+SNI_LIST=$ETC/sni-hosts.txt
+SNI_RES=$ETC/sni-results.txt
+SNI_MAX=3000
+# stdin -> clean host names: drops comments, schemes, paths, ports, "*.", duplicates
+sni_clean() {
+    tr 'A-Z\r' 'a-z\n' | sed -e 's/#.*//' | tr ' \t,;|' '\n\n\n\n\n' |
+        sed -e 's#^[a-z0-9+.-]*://##' -e 's#[/?].*##' -e 's/^\*\.//' -e 's/^\.//' -e 's/:[0-9]*$//' |
+        grep -E "^($RE_HOST)\$" | awk '!s[$0]++'
+}
+sni_add() { # stdin: text with hosts
+    mkdir -p "$ETC"; touch "$SNI_LIST"
+    before=$(wc -l <"$SNI_LIST")
+    { cat "$SNI_LIST"; sni_clean; } | awk '!s[$0]++' | head -n "$SNI_MAX" >"$SNI_LIST.new"
+    mv -f "$SNI_LIST.new" "$SNI_LIST"
+    after=$(wc -l <"$SNI_LIST")
+    ok "hosts: $after in the list ($((after - before)) new)"
+}
+sni_import() { # FILE or http(s) URL
+    [ -n "${1:-}" ] || die "usage: xec sni import FILE|URL"
+    case $1 in
+        http://* | https://*)
+            load_conf
+            t=/tmp/xec-sni.$$
+            # through the tunnel when it runs (the list site may be blocked), else direct
+            if is_running && env -u no_proxy -u NO_PROXY curl -fsSL --max-time 30 -x "socks5h://127.0.0.1:$SOCKS_PORT" -o "$t" "$1" 2>/dev/null; then :
+            elif env -u no_proxy -u NO_PROXY -u http_proxy -u https_proxy -u all_proxy curl -fsSL --connect-timeout 15 --max-time 40 -o "$t" "$1"; then :
+            else rm -f "$t"; die "cannot download $1"; fi
+            head -c 500000 "$t" | sni_add; rm -f "$t" ;;
+        *) [ -f "$1" ] || die "file not found: $1"; head -c 500000 "$1" | sni_add ;;
+    esac
+}
+secs_ms() { awk -v t="$1" 'BEGIN { printf "%d", t * 1000 }'; }
+# sni_check MODE HOST PROFILE FIELD -> "OK MS DETAIL" | "FAIL 0 DETAIL"
+sni_check() {
+    case $1 in
+        direct) # is the host itself reachable over TLS from this network?
+            # -k: only "does TLS with this SNI get through" matters here, not the certificate
+            r=$(env -u http_proxy -u https_proxy -u all_proxy curl -sk -o /dev/null -w '%{http_code} %{time_appconnect}' \
+                --connect-timeout 6 --max-time 10 "https://$2/" 2>/dev/null)
+            c=${r%% *} t=${r#* }
+            if [ "$(secs_ms "$t")" -gt 0 ]; then say "OK $(secs_ms "$t") tls+http_$c"; else say "FAIL 0 no-tls"; fi ;;
+        sni) # TLS handshake to YOUR server with this SNI (the bug-host test)
+            load_prof "$3" >/dev/null 2>&1 || { say "FAIL 0 no-profile"; return; }
+            r=$(env -u http_proxy -u https_proxy -u all_proxy curl -sk -o /dev/null -w '%{http_code} %{time_appconnect}' \
+                --connect-to "::$P_ADDR:$P_PORT" --connect-timeout 6 --max-time 10 "https://$2/" 2>/dev/null)
+            t=${r#* }
+            if [ "$(secs_ms "$t")" -gt 0 ]; then say "OK $(secs_ms "$t") handshake"; else say "FAIL 0 no-handshake"; fi ;;
+        tunnel) # the real thing: the profile with this host as SNI / address carries traffic
+            case $4 in addr) o="XEC_OV_ADDR=$2" ;; both) o="XEC_OV_SNI=$2 XEC_OV_ADDR=$2" ;; *) o="XEC_OV_SNI=$2" ;; esac
+            r=$(env $o "$SELF" test "$3" </dev/null 2>/dev/null | tail -n 1)
+            case $r in
+                *" OK "*) ms=$(printf '%s' "$r" | sed -n 's/.* OK \([0-9]*\)ms.*/\1/p'); say "OK ${ms:-0} tunnel" ;;
+                *) say "FAIL 0 tunnel" ;;
+            esac ;;
+    esac
+}
+# sni_scan MODE [PROFILE] [FIELD] - checks every host (parallel), saves and prints the results
+sni_scan() {
+    load_conf
+    mode=${1:-sni} pr=${2:-$ACTIVE} fld=${3:-sni}
+    match 'direct|sni|tunnel' "$mode" || die "mode: direct | sni | tunnel"
+    match 'sni|addr|both' "$fld" || die "field: sni | addr | both"
+    [ "$mode" = direct ] || prof_exists "$pr" || die "no profile to scan with (xec sni scan $mode PROFILE)"
+    [ -s "$SNI_LIST" ] || die "the host list is empty (xec sni add HOST ... | xec sni import FILE|URL)"
+    mkdir -p "$RUN"
+    total=$(wc -l <"$SNI_LIST") par=8; [ "$mode" = tunnel ] && par=3
+    : >"$RUN/sni.new"; printf '0 %s %s %s\n' "$total" "$mode" "$pr" >"$RUN/sni.progress"
+    log "SNI scan: $total hosts, mode $mode${pr:+, profile $pr}"
+    i=0
+    while IFS= read -r h; do
+        [ -n "$h" ] || continue
+        ( printf '%s\t%s\t%s\t%s\n' "$h" "$mode" "$(sni_check "$mode" "$h" "$pr" "$fld" | tr ' ' '\t' | cut -f1-3)" "$pr" >>"$RUN/sni.new" ) </dev/null &
+        i=$((i + 1))
+        if [ $((i % par)) -eq 0 ]; then wait; printf '%s %s %s %s\n' "$i" "$total" "$mode" "$pr" >"$RUN/sni.progress"; fi
+    done <"$SNI_LIST"
+    wait
+    # working first, fastest first
+    awk -F'\t' '{ print ($3 == "OK" ? 0 : 1) "\t" ($4 + 0) "\t" $0 }' "$RUN/sni.new" | sort -n -k1,1 -k2,2 | cut -f3- >"$SNI_RES"
+    rm -f "$RUN/sni.new" "$RUN/sni.progress"
+    okc=$(grep -c "	OK	" "$SNI_RES")
+    log "SNI scan done: $okc of $total work ($mode)"
+    sni_results
+}
+sni_results() {
+    [ -s "$SNI_RES" ] || { say "no scan results yet"; return 0; }
+    awk -F'\t' '{ printf "%-4s %-40s %6s ms  %s %s\n", $3, $1, $4, $2, $5 }' "$SNI_RES"
+    say "working: $(grep -c "	OK	" "$SNI_RES") of $(wc -l <"$SNI_RES")"
+}
+# sni_use HOST [PROFILE] [sni|addr|both] - write a host into a server profile
+sni_use() {
+    load_conf
+    h=${1:-} pr=${2:-$ACTIVE} fld=${3:-sni}
+    match "$RE_HOST" "$h" || die "usage: xec sni use HOST [PROFILE] [sni|addr|both]"
+    load_prof "$pr" || exit 1
+    case $fld in
+        sni) P_SNI=$h ;;
+        addr) P_ADDR=$h ;;
+        both) P_SNI=$h P_ADDR=$h ;;
+        *) die "field: sni | addr | both" ;;
+    esac
+    check_prof || exit 1
+    save_prof "$pr"
+    ok "$pr: $fld = $h"
+    [ "$pr" = "$ACTIVE" ] && is_running && cmd_start
+    return 0
+}
+cmd_sni() {
+    c=${1:-list}; [ $# -gt 0 ] && shift
+    case $c in
+        list) [ -s "$SNI_LIST" ] && cat "$SNI_LIST"; say "hosts: $(wc -l <"$SNI_LIST" 2>/dev/null || echo 0)" ;;
+        add) [ $# -gt 0 ] || die "usage: xec sni add HOST [HOST...]  (or: ... | xec sni add -)"
+            if [ "$1" = - ]; then sni_add; else printf '%s\n' "$@" | sni_add; fi ;;
+        del) [ -f "$SNI_LIST" ] && grep -vx "${1:-x}" "$SNI_LIST" >"$SNI_LIST.new"; mv -f "$SNI_LIST.new" "$SNI_LIST" 2>/dev/null; ok "removed ${1:-}" ;;
+        clear) rm -f "$SNI_LIST" "$SNI_RES"; ok "host list cleared" ;;
+        import) sni_import "$@" ;;
+        scan) sni_scan "$@" ;;
+        results) sni_results ;;
+        use) sni_use "$@" ;;
+        *) die "usage: xec sni list|add HOST..|del HOST|clear|import FILE|URL|scan [direct|sni|tunnel] [PROFILE] [sni|addr|both]|results|use HOST [PROFILE] [sni|addr|both]" ;;
+    esac
+}
 cmd_diag() {
     load_conf; lan_detect
     say "=== XE3000 CLIENT report $(date '+%F %T') (UUIDs and passwords are not included)"
@@ -742,10 +876,14 @@ after_add() { # NAME
 }
 cmd_add() { # NAME LINK | LINK
     if [ $# -ge 2 ]; then n=$1; link=$2; else n=''; link=${1:-}; fi
+    # name and link swapped (link pasted into the name field)
+    case $n in *://*) t=$n; n=$link; link=$t; case $n in *://*) n='' ;; esac ;; esac
     [ -n "$link" ] || die "usage: xec add [NAME] 'vless://...'  or  'ssh://user:pass@host:port?transport=tls&sni=...'"
     parse_link "$link" || exit 1
-    [ -n "$n" ] || n=$(name_from "$LNAME")
-    match "$RE_NAME" "$n" || die "bad name (A-Z a-z 0-9 _ - , max 32)"
+    if [ -n "$n" ]; then
+        g=$n; n=$(pick_name "$n" "${LNAME:-$P_ADDR}")
+        [ "$n" = "$g" ] || say "name \"$g\" is not allowed (A-Z a-z 0-9 _ -, max 32) - using: $n"
+    else n=$(pick_name "$LNAME" "$P_ADDR"); fi
     save_prof "$n"
     [ "$P_TYPE" = ssh ] && [ -n "$SSH_PASS" ] && store_pass "$n" "$SSH_PASS"
     ok "saved profile $n ($P_TYPE $P_ADDR:$P_PORT${P_SEC:+ $P_SEC}${P_SNI:+ sni=$P_SNI})"
@@ -760,8 +898,8 @@ cmd_import() { # links on stdin
     say "imported: $c"
 }
 cmd_add_ssh() { # NAME --host H [--port P] --user U [--pass P|--pass-stdin|--key] [--transport T] [--sni S] [--ws-host H] [--ws-path P] [--payload S]
-    n=${1:-}; shift 2>/dev/null
-    match "$RE_NAME" "$n" || die "usage: xec add-ssh NAME --host H --user U [--pass P | --pass-stdin | --key] [--port 22] [--transport direct|tls|ws|wss] [--sni S] [--ws-host H] [--ws-path /] [--payload STR]"
+    n=${1:-}; case $n in --*) n='' ;; *) shift 2>/dev/null ;; esac
+    [ $# -gt 0 ] || die "usage: xec add-ssh NAME --host H --user U [--pass P | --pass-stdin | --key] [--port 22] [--transport direct|tls|ws|wss] [--sni S] [--ws-host H] [--ws-path /] [--payload STR]"
     prof_clear; P_TYPE=ssh; P_PORT=22; P_TRANS=direct; P_AUTH=''; pw=''
     while [ $# -gt 0 ]; do
         case $1 in
@@ -781,6 +919,8 @@ cmd_add_ssh() { # NAME --host H [--port P] --user U [--pass P|--pass-stdin|--key
         esac
         shift
     done
+    g=$n; n=$(pick_name "$n" "$P_ADDR")
+    [ -z "$g" ] || [ "$n" = "$g" ] || say "name \"$g\" is not allowed (A-Z a-z 0-9 _ -, max 32) - using: $n"
     [ -n "$P_AUTH" ] || { [ -s "$PROF/$n.pass" ] && P_AUTH=pass || P_AUTH=key; }
     check_prof || exit 1
     save_prof "$n"
@@ -795,10 +935,9 @@ cmd_add_ssh() { # NAME --host H [--port P] --user U [--pass P|--pass-stdin|--key
 #   [--pbk KEY --sid ID --spx / --pqv KEY] [--enc none|auto|...] [--svc NAME] [--mode auto] [--remark R]
 # Editing an existing NAME keeps its id/password/pqv/encryption when those are not given.
 cmd_add_proxy() {
-    n=${1:-}; shift 2>/dev/null
-    match "$RE_NAME" "$n" || die "usage: xec add-proxy NAME --type vless|vmess|trojan --addr HOST --id UUID (or --pass PW) [--sec tls] [--sni SNI] [--host HOST] [--net ws] [--path /]"
+    n=${1:-}; case $n in --*) n='' ;; *) shift 2>/dev/null ;; esac
+    [ $# -gt 0 ] || die "usage: xec add-proxy NAME --type vless|vmess|trojan --addr HOST --id UUID (or --pass PW) [--sec tls] [--sni SNI] [--host HOST] [--net ws] [--path /]"
     old_id='' old_pqv='' old_enc='' old_type=''
-    if prof_exists "$n"; then load_prof "$n"; old_type=$P_TYPE old_id=$P_UUID old_pqv=$P_PQV old_enc=$P_ENC; fi
     prof_clear; P_PORT=443; P_NET=tcp; P_SEC=tls; id=''
     while [ $# -gt 0 ]; do
         case $1 in
@@ -830,6 +969,14 @@ cmd_add_proxy() {
         shift
     done
     match 'vless|vmess|trojan' "$P_TYPE" || die "--type vless|vmess|trojan"
+    g=$n; n=$(pick_name "$n" "$P_ADDR")
+    [ -z "$g" ] || [ "$n" = "$g" ] || say "name \"$g\" is not allowed (A-Z a-z 0-9 _ -, max 32) - using: $n"
+    # editing an existing profile: keep its secrets unless new ones are given
+    mkdir -p "$RUN"
+    if prof_exists "$n"; then
+        ( load_prof "$n"; printf '%s\n%s\n%s\n%s\n' "$P_TYPE" "$P_UUID" "$P_PQV" "$P_ENC" ) >"$RUN/old.$$" 2>/dev/null
+        { IFS= read -r old_type; IFS= read -r old_id; IFS= read -r old_pqv; IFS= read -r old_enc; } <"$RUN/old.$$"; rm -f "$RUN/old.$$"
+    fi
     if [ -z "$id" ] && [ "$old_type" = "$P_TYPE" ]; then id=$old_id; fi
     [ -n "$id" ] || die "missing --id (VLESS/VMess UUID) or --pass (Trojan password)"
     P_UUID=$id
@@ -1094,7 +1241,7 @@ cmd_cgi() {
     [ "$WEB_AUTH" != 1 ] || cgi_session || { printf 'Status: 401 Unauthorized\r\nContent-Type: application/json\r\n\r\n{"ok":false,"auth":false}\n'; exit 0; }
     if [ "${REQUEST_METHOD:-}" = POST ]; then
         [ "$(fv csrf)" = "$CSRF" ] || reply_err "bad CSRF token - reload the page"
-    elif [ "$a" != status ] && [ "$a" != logs ] && [ "$a" != diag ] && [ "$a" != csrf ] && [ "$a" != export ]; then
+    elif [ "$a" != status ] && [ "$a" != logs ] && [ "$a" != diag ] && [ "$a" != snistatus ] && [ "$a" != csrf ] && [ "$a" != export ]; then
         reply_err "POST only"
     fi
     case $a in
@@ -1107,6 +1254,28 @@ cmd_cgi() {
             printf 'Status: 200 OK\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename="xe-client-backup.txt"\r\nCache-Control: no-store\r\n\r\n'
             cmd_export; exit 0 ;;
         exitinfo) cgi_exitinfo ;;
+        snistatus)
+            # a scan that died leaves its progress file: forget it after 30 minutes
+            [ -n "$(find "$RUN/sni.progress" -mmin +30 2>/dev/null)" ] && rm -f "$RUN/sni.progress"
+            pr=''; [ -f "$RUN/sni.progress" ] && pr=$(cat "$RUN/sni.progress")
+            res=$(awk -F'\t' 'BEGIN { printf "[" } { printf "%s[\"%s\",\"%s\",\"%s\",%d,\"%s\",\"%s\"]", (NR > 1 ? "," : ""), $1, $2, $3, $4, $5, $6 } END { printf "]" }' "$SNI_RES" 2>/dev/null)
+            hl=$(head -n 3000 "$SNI_LIST" 2>/dev/null | jtext)
+            reply "{\"ok\":true,\"running\":$([ -n "$pr" ] && echo true || echo false),\"progress\":$(js "$pr"),\"count\":$(wc -l <"$SNI_LIST" 2>/dev/null || echo 0),\"hosts\":${hl:-\"\"},\"results\":${res:-[]}}" ;;
+        sniadd) fv hosts | run_json sni_add; exit 0 ;;
+        snifetch) run_json sni_import "$(fv url)" ;;
+        sniclear) run_json cmd_sni clear ;;
+        snidel) run_json cmd_sni del "$(fv host)" ;;
+        sniuse) run_json sni_use "$(fv host)" "$(fv name)" "$(fv field)" ;;
+        sniscan)
+            [ -f "$RUN/sni.progress" ] && reply_err "a scan is already running"
+            m=$(fv mode) n=$(fv name) f=$(fv field)
+            match 'direct|sni|tunnel' "$m" || reply_err "bad mode"
+            [ "$m" = direct ] || prof_exists "$n" || reply_err "choose a server"
+            match 'sni|addr|both' "${f:-sni}" || reply_err "bad field"
+            [ -s "$SNI_LIST" ] || reply_err "the host list is empty"
+            printf '0 %s %s %s\n' "$(wc -l <"$SNI_LIST")" "$m" "$n" >"$RUN/sni.progress"
+            ( "$SELF" sni scan "$m" "$n" "${f:-sni}" ) </dev/null >"$LOGD/sni-scan.log" 2>&1 &
+            reply '{"ok":true,"msg":"scan started"}' ;;
         diag) dgf="$RUN/diag.$$"; (cmd_diag) >"$dgf" 2>&1; t=$(sed 's/\x1b\[[0-9;]*m//g' "$dgf" | jtext); rm -f "$dgf"; reply "{\"ok\":true,\"msg\":$t}" ;;
         start) run_json cmd_start ;;
         stop) run_json cmd_stop ;;
@@ -1129,6 +1298,15 @@ cmd_cgi() {
             web_check "$(fv old)" || reply_err "current password is wrong"
             n=$(fv new); [ ${#n} -ge 6 ] || reply_err "new password: 6 characters or more"
             run_json web_setpass "$n" ;;
+        uninstall)
+            [ "$(fv confirm)" = YES ] || reply_err "confirmation missing"
+            o=''; [ "$(fv keep)" = 1 ] || o=--purge
+            [ "$(fv pkgs)" = 1 ] && o="$o --packages"
+            log "web: uninstall requested from ${REMOTE_ADDR:-?} ($o)"
+            # detached: stopping the web panel must not stop the uninstall
+            cp -f "$SELF" /tmp/xec-uninstall.sh
+            ( sleep 2; sh /tmp/xec-uninstall.sh uninstall $o; rm -f /tmp/xec-uninstall.sh ) </dev/null >/tmp/xec-uninstall.log 2>&1 &
+            reply '{"ok":true,"msg":"removing - the panel closes in a few seconds. Log: /tmp/xec-uninstall.log"}' ;;
         logout) [ -n "${tok:-}" ] && rm -f "$RUN/sess/$tok"; reply '{"ok":true}' ;;
         *) reply_err "unknown action" ;;
     esac
@@ -1268,7 +1446,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
 <div id="login" class="card hide"><h3>XE3000 Client</h3><label>كلمة المرور / Password</label><input id="lp" type="password" autocomplete="current-password"><br><br><button class="btn" id="lb">دخول</button><p class="mut">نسيت كلمة المرور؟ عبر SSH: <code>xec web password</code></p></div>
 <div id="app" class="hide">
 <header><b>XE3000 Client</b><span id="hb" class="badge y">…</span><span class="sp"></span><button class="btn sec" id="lo">خروج</button></header>
-<nav id="nav"><button data-t="st" class="on">الحالة</button><button data-t="pr">الخوادم</button><button data-t="ad">إضافة</button><button data-t="se">الإعدادات</button><button data-t="lg">السجلات</button><button data-t="to">الأدوات</button></nav>
+<nav id="nav"><button data-t="st" class="on">الحالة</button><button data-t="pr">الخوادم</button><button data-t="ad">إضافة</button><button data-t="se">الإعدادات</button><button data-t="sn">فاحص SNI</button><button data-t="lg">السجلات</button><button data-t="to">الأدوات</button></nav>
 <main>
 <section id="t-st">
  <div class="card"><h3>الاتصال</h3>
@@ -1338,6 +1516,26 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
  <label>وجهات مباشرة (IP/CIDR أو domain:example.sa)</label><input id="v-BYPASS_DST" placeholder="domain:gov.sa 1.2.3.0/24">
  <label>رابط فحص الاتصال</label><input id="v-CHECK_URL"><br><br>
  <button class="btn" id="se-go">حفظ الإعدادات</button></div></section>
+<section id="t-sn" class="hide">
+ <div class="card"><h3>قائمة هوستات SNI (<span id="sn-count">0</span>)</h3>
+  <p class="mut">أضف هوستات (Bug hosts) سطراً لكل هوست، أو ارفع ملف txt، أو ضع رابط قائمة. تُحفظ في الراوتر.</p>
+  <textarea id="sn-add" placeholder="zain.com.sa&#10;m.facebook.com&#10;web.whatsapp.com"></textarea><br><br>
+  <button class="btn" id="sn-addb">إضافة</button>
+  <label class="btn sec" style="display:inline-block;cursor:pointer">رفع ملف txt<input type="file" id="sn-file" accept=".txt,text/plain" style="display:none"></label>
+  <div class="row" style="margin-top:8px"><div><input id="sn-url" placeholder="https://example.com/hosts.txt"></div><div><button class="btn sec" id="sn-urlb">تحميل من رابط</button></div></div>
+  <details style="margin-top:8px"><summary class="mut">عرض القائمة</summary><pre id="sn-list"></pre></details>
+  <button class="btn dng" id="sn-clear" style="margin-top:8px">مسح القائمة</button></div>
+ <div class="card"><h3>الفحص</h3>
+  <label>نوع الفحص</label><select id="sn-mode">
+   <option value="sni">SNI إلى سيرفرك: هل تنجح مصافحة TLS مع سيرفرك بهذا الهوست؟ (سريع)</option>
+   <option value="tunnel">عبر النفق الكامل: هل يعمل الإنترنت فعلاً بهذا الهوست؟ (أدق، أبطأ)</option>
+   <option value="direct">مباشر: هل الهوست نفسه يفتح من شبكتك؟</option></select>
+  <div class="row"><div><label>السيرفر</label><select id="sn-prof"></select></div>
+   <div><label>أين يوضع الهوست</label><select id="sn-field"><option value="sni">SNI</option><option value="addr">عنوان السيرفر (address)</option><option value="both">الاثنان</option></select></div></div><br>
+  <button class="btn" id="sn-go">ابدأ الفحص</button> <span id="sn-prog" class="mut"></span></div>
+ <div class="card"><h3>النتائج</h3><p class="mut">الشغالة أولاً والأسرع أولاً. زر "استخدم" يضع الهوست في السيرفر المختار.</p>
+  <table><thead><tr><th>الهوست</th><th>النتيجة</th><th>ms</th><th></th></tr></thead><tbody id="sn-res"></tbody></table></div>
+</section>
 <section id="t-lg" class="hide"><div class="card"><h3>السجلات والتشخيص</h3>
  <p class="mut">تقرير كامل بحالة النفق والسيرفر والمنافذ والأخطاء. لا يحتوي على UUID أو كلمات المرور، ويمكنك نسخه وإرساله للمساعدة.</p>
  <button class="btn" id="lg-r">تحديث</button><button class="btn sec" id="lg-c">نسخ التقرير</button><label style="display:inline-flex;gap:6px;align-items:center;margin:0 8px"><input type="checkbox" id="lg-a" style="width:auto"> تحديث تلقائي</label>
@@ -1346,6 +1544,11 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
  <div class="card"><h3>الأدوات</h3>
   <button class="btn" data-a="test">اختبار النفق</button><button class="btn sec" data-a="update">تحديث Xray</button><button class="btn sec" data-a="watchdog">تشغيل المراقب الآن</button><button class="btn sec" id="lg">السجلات</button><a class="btn sec" href="cgi-bin/api?a=export" style="text-decoration:none;display:inline-block"><button class="btn sec" type="button">تصدير نسخة احتياطية</button></a>
   <pre id="out" class="hide"></pre></div>
+ <div class="card" style="border-color:var(--bad)"><h3>حذف السكربت بالكامل</h3>
+  <p class="mut">يحذف السكربت وXray ولوحة الويب وقواعد النفق، وتعود الشبكة للإنترنت العادي. لا يمكن التراجع.</p>
+  <label class="tog" style="border:0"><span>الإبقاء على السيرفرات والإعدادات (لإعادة التثبيت لاحقاً)</span><input type="checkbox" id="u-keep"></label>
+  <label class="tog" style="border:0"><span>حذف الحزم التي ثبّتها السكربت أيضاً (openssh-client, sshpass ...)</span><input type="checkbox" id="u-pkgs"></label>
+  <button class="btn dng" id="u-go">حذف السكربت بالكامل</button></div>
  <div class="card" id="pw-card"><h3>كلمة مرور اللوحة</h3><div class="row"><div><label>الحالية</label><input id="p-old" type="password"></div><div><label>الجديدة (6+)</label><input id="p-new" type="password"></div></div><br><button class="btn" id="p-go">تغيير</button></div>
 </section>
 </main></div>
@@ -1371,6 +1574,21 @@ $("lp").onkeydown=function(e){if(e.key=="Enter")$("lb").onclick()};
 $("lo").onclick=function(){api("logout",{}).then(function(){location.reload()})};
 function loadDiag(){$("lg-r").disabled=true;api("diag").then(function(j){$("lg-r").disabled=false;$("lg-out").textContent=j.msg||"-"}).catch(function(){$("lg-r").disabled=false})}
 $("lg-r").onclick=loadDiag;
+var snT=null;
+function loadSni(){var ps=$("sn-prof"),cur=ps.value;if(S){ps.innerHTML=S.profiles.map(function(p){return'<option value="'+esc(p.name)+'">'+esc(p.name)+' ('+esc(p.type)+')</option>'}).join("");ps.value=cur||S.active}
+  api("snistatus").then(function(j){$("sn-count").textContent=j.count;$("sn-list").textContent=j.hosts;
+    if(j.running){var p=j.progress.split(" ");$("sn-prog").textContent="جارٍ الفحص: "+p[0]+" / "+p[1];$("sn-go").disabled=true;clearTimeout(snT);snT=setTimeout(loadSni,2500)}
+    else{$("sn-prog").textContent="";$("sn-go").disabled=false}
+    var h="";j.results.forEach(function(r){var ok=r[2]=="OK";h+='<tr><td><span class=addr>'+esc(r[0])+'</span><br><small class="mut">'+esc(r[1])+(r[5]?" · "+esc(r[5]):"")+'</small></td><td>'+(ok?'<span class="badge g">يعمل</span>':'<span class="badge r">لا يعمل</span>')+'</td><td>'+(ok?r[3]:"-")+'</td><td>'+(ok?'<button class="btn" data-sh="'+esc(r[0])+'">استخدم</button>':'')+'</td></tr>'});
+    $("sn-res").innerHTML=h||'<tr><td colspan=4 class="mut">لا توجد نتائج بعد</td></tr>';
+    $("sn-res").querySelectorAll("[data-sh]").forEach(function(b){b.onclick=function(){var f=$("sn-field").value,n=$("sn-prof").value;if(confirm("وضع "+b.dataset.sh+" في "+n+" ("+f+")؟"))act("sniuse",{host:b.dataset.sh,name:n,field:f},b)}})})}
+$("sn-addb").onclick=function(){var t=$("sn-add").value;if(!t.trim())return;act("sniadd",{hosts:t},this).then(function(j){if(j&&j.ok){$("sn-add").value="";loadSni()}})};
+$("sn-file").onchange=function(){var f=this.files[0];if(!f)return;if(f.size>500000)return toast("الملف كبير جداً (الحد 500KB)",true);var r=new FileReader();r.onload=function(){act("sniadd",{hosts:r.result}).then(loadSni)};r.readAsText(f);this.value=""};
+$("sn-urlb").onclick=function(){var u=$("sn-url").value.trim();if(!/^https?:\/\//.test(u))return toast("ضع رابطاً يبدأ بـ http:// أو https://",true);act("snifetch",{url:u},this).then(loadSni)};
+$("sn-clear").onclick=function(){if(confirm("مسح قائمة الهوستات والنتائج؟"))act("sniclear",{},this).then(loadSni)};
+$("sn-go").onclick=function(){var m=$("sn-mode").value;act("sniscan",{mode:m,name:$("sn-prof").value,field:$("sn-field").value},this).then(function(){setTimeout(loadSni,800)})};
+$("u-go").onclick=function(){var t=prompt("سيتم حذف السكربت بالكامل. اكتب YES للتأكيد");if(t!=="YES")return toast("تم الإلغاء");
+  api("uninstall",{confirm:"YES",keep:$("u-keep").checked?"1":"0",pkgs:$("u-pkgs").checked?"1":"0"}).then(function(j){toast(j.msg,!j.ok);if(j.ok){clearInterval(timer);document.querySelectorAll("button").forEach(function(b){b.disabled=true})}})};
 setInterval(function(){if(tab=="lg"&&$("lg-a").checked)loadDiag()},10000);
 function copyText(t){ // http:// pages have no navigator.clipboard - fall back to a hidden textarea
   if(navigator.clipboard&&window.isSecureContext)return navigator.clipboard.writeText(t).then(function(){return true},function(){return fallback()});
@@ -1378,7 +1596,7 @@ function copyText(t){ // http:// pages have no navigator.clipboard - fall back t
   function fallback(){var a=document.createElement("textarea");a.value=t;a.setAttribute("readonly","");a.style.position="fixed";a.style.top="-1000px";document.body.appendChild(a);a.select();a.setSelectionRange(0,t.length);var ok=false;try{ok=document.execCommand("copy")}catch(e){}document.body.removeChild(a);return ok}}
 $("lg-c").onclick=function(){copyText($("lg-out").textContent).then(function(ok){toast(ok?"تم نسخ التقرير":"لم يتم النسخ - حدد النص يدوياً",!ok)})};
 function start(){$("login").classList.add("hide");$("app").classList.remove("hide");load();clearInterval(timer);timer=setInterval(function(){if(tab=="st")load()},5000)}
-document.querySelectorAll("#nav button").forEach(function(b){b.onclick=function(){tab=b.dataset.t;if(tab=="lg")loadDiag();document.querySelectorAll("#nav button").forEach(function(x){x.classList.toggle("on",x==b)});document.querySelectorAll("main>section").forEach(function(s){s.classList.toggle("hide",s.id!="t-"+tab)});if(tab=="se")fillSettings()}});
+document.querySelectorAll("#nav button").forEach(function(b){b.onclick=function(){tab=b.dataset.t;if(tab=="lg")loadDiag();if(tab=="sn")loadSni();document.querySelectorAll("#nav button").forEach(function(x){x.classList.toggle("on",x==b)});document.querySelectorAll("main>section").forEach(function(s){s.classList.toggle("hide",s.id!="t-"+tab)});if(tab=="se")fillSettings()}});
 document.querySelectorAll("[data-a]").forEach(function(b){b.onclick=function(){act(b.dataset.a,{},b).then(function(j){if(j&&["test","update","watchdog","ping"].indexOf(b.dataset.a)>=0){$("out").textContent=j.msg;$("out").classList.remove("hide")}})}});
 function kind(p){if(p.type=="ssh")return'<span class="chip">SSH</span><span class="chip">'+esc(p.trans)+'</span>';var h='<span class="chip">'+esc(String(p.type).toUpperCase())+'</span><span class="chip">'+esc(p.net)+'</span><span class="chip">'+esc(p.sec)+'</span>';if(p.flow)h+='<span class="chip">Vision</span>';if(p.pq_sig)h+='<span class="chip">PQ-sig</span>';if(p.pq_enc)h+='<span class="chip">PQ-enc</span>';if(p.pinned)h+='<span class="chip">pinned</span>';return h}
 function load(){api("status").then(function(j){S=j;$("lo").classList.toggle("hide",!j.auth);$("pw-card").classList.toggle("hide",!j.auth);
@@ -1547,6 +1765,8 @@ cmd_install() {
         say "installing packages:$miss"
         opkg update >/tmp/xec-opkg.log 2>&1 || { tail -n 5 /tmp/xec-opkg.log; die "opkg update failed (internet?)"; }
         opkg install $miss >>/tmp/xec-opkg.log 2>&1 || { tail -n 10 /tmp/xec-opkg.log; die "opkg install failed"; }
+        # remember what we added, so "uninstall --packages" removes only those
+        mkdir -p "$ETC"; for p in $miss; do grep -qx "$p" "$ETC/installed-pkgs" 2>/dev/null || echo "$p" >>"$ETC/installed-pkgs"; done
         ok "packages installed"
     fi
     [ $ssh = 0 ] || ssh_bin >/dev/null || die "OpenSSH client not usable"
@@ -1575,24 +1795,39 @@ cmd_install() {
     [ -n "$ACTIVE" ] || say "next      : xec add NAME 'vless://...'   then   xec start"
     return 0
 }
+# uninstall [--purge] [--packages]  (--purge: also settings/servers; --packages: also the
+# OpenWrt packages this script installed, e.g. openssh-client sshpass)
 cmd_uninstall() {
-    [ -x "$INIT" ] && { "$INIT" stop; "$INIT" disable; }
-    [ -x "$INIT_WEB" ] && { "$INIT_WEB" stop; "$INIT_WEB" disable; }
+    purge=0 pk=0
+    for o in "$@"; do case $o in --purge) purge=1 ;; --packages) pk=1 ;; --all) purge=1 pk=1 ;; esac; done
+    say "removing XE3000 CLIENT ..."
+    [ -x "$INIT" ] && { "$INIT" stop; "$INIT" disable; } 2>/dev/null
+    [ -x "$INIT_WEB" ] && { "$INIT_WEB" stop; "$INIT_WEB" disable; } 2>/dev/null
     load_conf; lan_detect; fw_off
+    # leftovers: probe clients, ssh tunnels, a manually started xray
+    for x in $(pgrep -f "$OPT/bin/xray") $(pgrep -f "D 127.0.0.1:$SSH_SOCKS") $(pgrep -f "$SELF _pc"); do kill "$x" 2>/dev/null; done
     uci -q delete firewall.xe_client && uci commit firewall
+    /etc/init.d/firewall reload >/dev/null 2>&1
     if [ -f /etc/crontabs/root ]; then
         grep -v '/usr/bin/xec' /etc/crontabs/root >/etc/crontabs/root.new
         mv -f /etc/crontabs/root.new /etc/crontabs/root
+        /etc/init.d/cron restart 2>/dev/null
     fi
-    /etc/init.d/cron restart 2>/dev/null
-    rm -rf "$OPT" "$RUN" "$LOGD" "$INIT" "$INIT_WEB"
-    if [ "${1:-}" = --purge ]; then
+    rm -rf "$OPT" "$RUN" "$LOGD" "$INIT" "$INIT_WEB" /tmp/xec-dl.* /tmp/xec-opkg.log
+    if [ $pk = 1 ] && [ -s "$ETC/installed-pkgs" ]; then
+        say "removing packages: $(tr '\n' ' ' <"$ETC/installed-pkgs")"
+        # reverse order: dependents first
+        opkg remove $(awk '{ l[NR] = $0 } END { for (i = NR; i >= 1; i--) print l[i] }' "$ETC/installed-pkgs") >/dev/null 2>&1 ||
+            warn "some packages were kept (other software needs them)"
+    fi
+    if [ $purge = 1 ]; then
         rm -rf "$ETC"; sed -i "\#^$ETC/\$#d" /etc/sysupgrade.conf 2>/dev/null
-        ok "removed (settings deleted)"
+        ok "XE3000 CLIENT removed completely (script, Xray, web panel, settings and servers)"
     else
         ok "removed (settings kept in $ETC - delete with: rm -rf $ETC)"
     fi
     rm -f "$SELF" "$MENU_CMD"
+    say "the LAN uses the normal internet again"
 }
 
 # ------------------------------------------------------------------- menu
@@ -1653,6 +1888,36 @@ menu_proxy() {
     printf '%s\n' "$id" | (cmd_add_proxy "$@" --secret-stdin)
     return 0
 }
+menu_sni() {
+    while true; do
+        load_conf
+        say ""; say "---- SNI host scanner | hosts: $(wc -l <"$SNI_LIST" 2>/dev/null || echo 0) | server: $ACTIVE"
+        say " 1) add hosts (type/paste, empty line = done)   2) import from file or URL"
+        say " 3) scan: SNI to my server (fast)                4) scan: full tunnel (exact)"
+        say " 5) scan: direct (host reachable?)               6) show results"
+        say " 7) use a working host in a server               8) show list   9) clear list"
+        say " 0) back"
+        ask "choice: " || return 0
+        case $REPLY in
+            1) say "hosts (one per line, empty line to finish):"; t=''
+               while ask "> "; do [ -z "$REPLY" ] && break; t="$t$REPLY
+"; done; printf '%s' "$t" | sni_add ;;
+            2) ask "file path or http(s) link: " || return 0; (sni_import "$REPLY") ;;
+            3 | 4) m=sni; [ "$REPLY" = 4 ] && m=tunnel
+               ask "server [$ACTIVE]: " || return 0; n=${REPLY:-$ACTIVE}; f=sni
+               if [ "$m" = tunnel ]; then ask "put the host in: sni | addr | both [sni]: " || return 0; f=${REPLY:-sni}; fi
+               (sni_scan "$m" "$n" "$f") ;;
+            5) (sni_scan direct) ;;
+            6) sni_results ;;
+            7) ask "host: " || return 0; h=$REPLY; ask "server [$ACTIVE]: " || return 0; n=${REPLY:-$ACTIVE}
+               ask "put it in: sni | addr | both [sni]: " || return 0; (sni_use "$h" "$n" "${REPLY:-sni}") ;;
+            8) cat "$SNI_LIST" 2>/dev/null ;;
+            9) (cmd_sni clear) ;;
+            0 | x) return 0 ;;
+            *) err "invalid option" ;;
+        esac
+    done
+}
 cmd_menu() {
     while true; do
         say ""
@@ -1668,11 +1933,16 @@ cmd_menu() {
         say " 7) test tunnel + exit IP       8) settings"
         say " 9) web panel password on/off  10) update Xray"
         say "11) show logs                  12) SSH public key"
+        say "15) SNI host scanner (bug hosts)"
+        say "99) uninstall - remove the script completely"
         say " 0) exit"
         ask "choice: " || return 0
         case $REPLY in
-            1) ask "name (empty = auto): " || return 0; n=$REPLY; ask "link (vless:// vmess:// trojan:// ssh://): " || return 0
-               if [ -n "$n" ]; then (cmd_add "$n" "$REPLY"); else (cmd_add "$REPLY"); fi ;;
+            1) ask "link (vless:// vmess:// trojan:// ssh://): " || return 0; l=$REPLY
+               case $l in *://*) ;; *) err "that is not a link - paste the whole vless:// vmess:// trojan:// or ssh:// link"; continue ;; esac
+               ask "name (empty = automatic): " || return 0
+               case $REPLY in *://*) REPLY='' ;; esac
+               if [ -n "$REPLY" ]; then (cmd_add "$REPLY" "$l"); else (cmd_add "$l"); fi ;;
             2) menu_ssh '' ;;
             13) menu_ssh wss ;;
             14) menu_proxy ;;
@@ -1694,6 +1964,13 @@ cmd_menu() {
             10) (cmd_update_xray) ;;
             11) tail -n 30 "$LOGF" 2>/dev/null; tail -n 15 "$LOGD/xray.log" 2>/dev/null ;;
             12) (ssh_key) ;;
+            15) menu_sni ;;
+            99) say "This removes the script, Xray, the web panel and the tunnel rules."
+                ask "also delete saved servers and settings? y/N: " || return 0; o=''; [ "$REPLY" = y ] && o=--purge
+                ask "also remove the packages it installed (openssh-client, sshpass ...)? y/N: " || return 0; [ "$REPLY" = y ] && o="$o --packages"
+                ask "type YES to remove: " || return 0
+                if [ "$REPLY" = YES ]; then cmd_uninstall $o; exit 0; fi
+                say "cancelled" ;;
             0 | q | x) return 0 ;;
             *) err "invalid option" ;;
         esac
@@ -1708,6 +1985,9 @@ XE3000 CLIENT $XEC_VERSION - router -> your server (VLESS REALITY / SSH)
                                 [--xray-version vX.Y.Z | --xray-zip F --xray-dgst F]
   menu1  (or: xec menu)      interactive menu
   xec status | start | stop | restart | test [NAME] | ping | diag
+  xec sni add HOST.. | import FILE|URL | list | clear | results
+  xec sni scan [direct|sni|tunnel] [PROFILE] [sni|addr|both]   SNI / bug-host scanner
+  xec sni use HOST [PROFILE] [sni|addr|both]                   put a working host into a server
   xec add [NAME] 'vless://UUID@HOST:443?security=reality&sni=...&pbk=...&sid=...&flow=xtls-rprx-vision&fp=chrome[&pqv=...]'
   xec add [NAME] 'vmess://BASE64-JSON'   'trojan://PASSWORD@HOST:443?security=tls&sni=...[&type=ws&path=/..][&pcs=CERT_SHA256]'
   xec add [NAME] 'ssh://USER:PASS@HOST:443?transport=tls|ws|wss&sni=BUGHOST[&host=WSHOST&path=/]'
@@ -1721,7 +2001,8 @@ XE3000 CLIENT $XEC_VERSION - router -> your server (VLESS REALITY / SSH)
   xec set [KEY VALUE]        ROUTE all|proxy, DNS_TUNNEL, BLOCK_QUIC, BLOCK_V6, KILLSWITCH, FAILOVER 0|1 ...
   xec route on|off           xec bypass add|del LAN_IP
   xec web on|off|url|password [NEW]|auth on|off   (default: no password, LAN only)
-  xec stats | logs | update-xray | export > file | restore FILE | uninstall [--purge]
+  xec stats | logs | update-xray | export > file | restore FILE
+  xec uninstall [--purge] [--packages] [--all]   remove the script (--all = everything incl. servers + packages)
 EOF
 }
 
@@ -1745,6 +2026,7 @@ case $cmd in
     test) cmd_test "$@" ;;
     ping) cmd_ping ;;
     diag) cmd_diag ;;
+    sni) cmd_sni "$@" ;;
     set) cmd_set "$@" ;;
     route) cmd_route "$@" ;;
     bypass) cmd_bypass "$@" ;;

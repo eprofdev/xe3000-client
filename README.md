@@ -75,6 +75,21 @@ xec uninstall [--purge]
 - فيها حقل **SNI** (الـ Bug host أو serverName في TLS) وحقل **Host** (ترويسة WebSocket / HTTP)، والمسار، ونوع النقل، وFlow (XTLS Vision)، وREALITY، وبصمة الشهادة `pcs`.
 - زر **تعديل** بجانب كل سيرفر يعيد فتح النموذج بقيمه. اترك UUID أو كلمة المرور فارغة للإبقاء على المحفوظة.
 
+**فاحص SNI (Bug hosts):** من تبويب **فاحص SNI** في اللوحة، أو الخيار **15** في `menu1`، أو الأمر `xec sni`.
+- **القائمة:** أضف الهوستات كتابةً أو من ملف txt أو من رابط قائمة، وتُحفظ في `/etc/xe-client/sni-hosts.txt`. تُحذف تلقائياً الروابط والمسارات والمنافذ و`*.` والمكرر.
+- **أنواع الفحص:**
+  - **SNI إلى سيرفرك** (سريع): هل تنجح مصافحة TLS مع سيرفرك عندما يكون هذا الهوست هو الـ SNI؟
+  - **عبر النفق الكامل** (الأدق): يشغّل سيرفرك بهذا الهوست في الـ SNI، أو في العنوان، أو في الاثنين، ويتأكد أن الإنترنت يعمل فعلاً.
+  - **مباشر:** هل الهوست نفسه يفتح من شبكتك؟
+- **النتائج:** تُحفظ، وتظهر الشغالة أولاً والأسرع أولاً. زر **استخدم** (أو `xec sni use HOST SERVER sni|addr|both`) يضع الهوست في سيرفرك ويعيد تشغيل النفق.
+
+```sh
+xec sni add zain.com.sa m.facebook.com
+xec sni import https://example.com/hosts.txt
+xec sni scan tunnel cloudflare addr      # الهوست في عنوان السيرفر، ويبقى SNI وHost كما هما
+xec sni use zain.com.sa cloudflare addr
+```
+
 **Payload** لـ WebSocket (اختياري): `GET [path] HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]`
 (المتغيرات المتاحة: `[host]` و`[path]` و`[sni]` و`[crlf]` و`[lf]` و`[cr]`)
 

@@ -187,6 +187,8 @@ net_up() {
     : >"$W/http.log"
     I python3 "$HERE/helpers.py" http 203.0.113.10 80 "$W/http.log" >"$W/h-http.out" 2>&1 &
     I python3 "$HERE/helpers.py" dns 203.0.113.53 "$W/dns.log" >"$W/h-dns.out" 2>&1 &
+    I python3 "$HERE/helpers.py" tls 203.0.113.10:443 203.0.113.10:80 "$W/bug.crt" "$W/bug.key" "$W/tls-inet.log" >"$W/h-tls3.out" 2>&1 &
+    X sh -c 'grep -q good1.example /etc/hosts || echo "203.0.113.10 good1.example" >>/etc/hosts'
     N openssl s_server -quiet -accept 127.0.0.1:19443 -cert "$W/www.crt" -key "$W/www.key" -cert_chain "$W/chain.crt" -www >/dev/null 2>&1 &
     N "$XRAY_HOST" run -c "$W/server.json" >"$W/xray-server.out" 2>&1 &
     N /usr/sbin/sshd -D -f "$W/sshd_config" -E "$W/sshd.log" &
@@ -274,6 +276,28 @@ done
 r=$(X xec test tjbad); echo "    | $r"; case $r in *FAIL*) pass "wrong Trojan password fails" ;; *) fail "wrong Trojan password worked" ;; esac
 r=$(X xec test vmbadpin); echo "    | $r"; case $r in *FAIL*) pass "wrong certificate pin (pcs) is refused" ;; *) fail "wrong pcs worked" ;; esac
 
+step "SNI host scanner"
+X xec sni add www.example.com bad-sni.example.org | sed 's/^/    | /'
+X xec sni import http://203.0.113.10/hosts.txt | sed 's/^/    | /'
+X cat /etc/xe-client/sni-hosts.txt | tr '\n' ' ' >"$W/snilist"; echo "    | list: $(cat "$W/snilist")"
+t "host list: typed + imported from a link, cleaned and de-duplicated" test "$(cat "$W/snilist")" = "www.example.com bad-sni.example.org good1.example "
+X xec sni scan tunnel A sni >"$W/sni-t.out" 2>&1; sed 's/^/    | /' "$W/sni-t.out"
+t "scan through the tunnel (REALITY A): the right SNI works" grep -q '^OK   www.example.com' "$W/sni-t.out"
+t "  ... and wrong SNIs fail" sh -c "grep -q '^FAIL bad-sni.example.org' '$W/sni-t.out' && grep -q '^FAIL good1.example' '$W/sni-t.out'"
+X xec sni scan sni tj >"$W/sni-s.out" 2>&1; sed 's/^/    | /' "$W/sni-s.out"
+t "scan 'SNI to my server' (TLS handshake with each SNI)" grep -q '^OK   www.example.com' "$W/sni-s.out"
+X xec sni scan direct >"$W/sni-d.out" 2>&1; sed 's/^/    | /' "$W/sni-d.out"
+t "scan direct: reachable host OK, unknown host FAIL" sh -c "grep -q '^OK   good1.example' '$W/sni-d.out' && grep -q '^FAIL bad-sni.example.org' '$W/sni-d.out'"
+X xec sni use www.example.com badsni sni | sed 's/^/    | /'
+r=$(X xec test badsni); echo "    | $r"; case $r in *OK*) pass "sni use: a working host fixes the server that had a wrong SNI" ;; *) fail "sni use" ;; esac
+printf '15\n1\nfoo.example\n\n0\n0\n' | OW_EXTRA_ENV="NO_COLOR=1" ow_exec menu1 >"$W/menu15.out" 2>&1
+t "menu1 option 15: add hosts" X grep -qx foo.example /etc/xe-client/sni-hosts.txt
+X xec add 'my server' "$LINK_TJ" | sed 's/^/    | /'
+t "name with a space is turned into a valid name" X test -f /etc/xe-client/profiles/my_server.conf
+X xec add "$LINK_TJ" "tjswap" >/dev/null 2>&1
+t "link and name in the wrong order still work" X test -f /etc/xe-client/profiles/tjswap.conf
+X xec del my_server >/dev/null; X xec del tjswap >/dev/null
+
 step "manual entry (SNI + Host without a link)"
 X xec add-proxy tjm --type trojan --addr 198.51.100.20 --port 7444 --pass Tr0jan-pass --net ws --path /tj \
     --sni www.example.com --host www.example.com --pcs "$PCS" | sed 's/^/    | /'
@@ -351,7 +375,7 @@ t "wrong password refused" sh -c "ip netns exec xeclan env -u HTTP_PROXY -u http
 CS=$(api -d 'a=login&pass=Web-pass-123' http://192.168.8.1:8899/cgi-bin/api | python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf"])')
 t "login -> session + CSRF token" test ${#CS} = 32
 api "http://192.168.8.1:8899/cgi-bin/api?a=status" >"$W/status.json"
-t "status JSON valid, running, 19 profiles" python3 -c "import json; j=json.load(open('$W/status.json')); assert j['running'] and j['active']=='A' and len(j['profiles'])==19, j"
+t "status JSON valid, running, 19 profiles" python3 -c "import json; j=json.load(open('$W/status.json')); assert j['running'] and j['active']=='A' and len(j['profiles'])==19, len(j['profiles'])"
 t "status never contains passwords" sh -c "! grep -q 'Pa55-w0rd' '$W/status.json'"
 t "POST without CSRF refused" sh -c "ip netns exec xeclan env -u HTTP_PROXY -u http_proxy curl -s -b '$J' -d 'a=set&key=LOGLEVEL&value=info' http://192.168.8.1:8899/cgi-bin/api | grep -q 'CSRF'"
 r=$(api -d "a=set&key=LOGLEVEL&value=info&csrf=$CS" http://192.168.8.1:8899/cgi-bin/api); echo "    | $r"
@@ -371,6 +395,10 @@ t "exit IP / Cloudflare station via web" python3 -c "import json; j=json.loads('
 t "backup export" sh -c "ip netns exec xeclan env -u HTTP_PROXY -u http_proxy curl -s -b '$J' 'http://192.168.8.1:8899/cgi-bin/api?a=export' | grep -q '@@FILE profiles/A.conf'"
 api "http://192.168.8.1:8899/cgi-bin/api?a=logs" >"$W/logs.json"
 api "http://192.168.8.1:8899/cgi-bin/api?a=diag" >"$W/diag.json"
+r=$(api -d "a=sniadd&csrf=$CS" --data-urlencode $'hosts=web1.example\nweb2.example' http://192.168.8.1:8899/cgi-bin/api); echo "    | $r"
+r=$(api -d "a=sniscan&mode=sni&name=tj&field=sni&csrf=$CS" http://192.168.8.1:8899/cgi-bin/api); echo "    | $r"
+i=0; while [ $i -lt 60 ]; do api "http://192.168.8.1:8899/cgi-bin/api?a=snistatus" >"$W/sni.json"; grep -q '"running":false' "$W/sni.json" && break; sleep 2; i=$((i + 1)); done
+t "SNI tab: add hosts, background scan, results via web" python3 -c "import json; j=json.load(open('$W/sni.json')); assert j['count']>=6 and any(r[0]=='www.example.com' and r[2]=='OK' for r in j['results']), j"
 t "logs screen: diagnostic report via web" python3 -c "import json; j=json.load(open('$W/diag.json')); assert j['ok'] and 'XE3000 CLIENT report' in j['msg'] and '$UUID' not in j['msg']"
 t "logs via web" python3 -c "import json; assert json.load(open('$W/logs.json'))['ok']"
 api -d "a=del&name=webA&csrf=$CS" http://192.168.8.1:8899/cgi-bin/api >/dev/null
@@ -446,9 +474,23 @@ out=$(lan_get /hello)
 t "stop: normal internet again" sh -c "[ '$out' = HELLO-XE3000 ] && [ '$(lastpeer)' = 192.168.8.100 ]"
 X iptables-save >"$W/save" 2>&1
 t "stop: no XEC rules left" sh -c "! grep -q XEC_ '$W/save'"
-X xec uninstall --purge | sed 's/^/    | /'
+printf '99\nn\nn\nno\n0\n' | OW_EXTRA_ENV="NO_COLOR=1" ow_exec menu1 >"$W/menu99.out" 2>&1
+t "menu1 option 99: without YES it is cancelled" grep -q cancelled "$W/menu99.out"
+t "  ... and nothing is removed" X test -x /usr/bin/xec
+X xec start >/dev/null
+J2="$W/cookies2"; rm -f "$J2"
+CS2=$(C curl -s -c "$J2" -d 'a=login&pass=Web-pass-123' http://192.168.8.1:8899/cgi-bin/api | python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf"])')
+X cat /etc/xe-client/installed-pkgs | tr '\n' ' ' | sed 's/^/    | packages added by the installer: /'; echo
+r=$(C curl -s -b "$J2" -d "a=uninstall&confirm=YES&pkgs=1&csrf=$CS2" http://192.168.8.1:8899/cgi-bin/api); echo "    | $r"
+i=0; while [ $i -lt 60 ] && X test -e /usr/bin/xec; do sleep 1; i=$((i + 1)); done; sleep 2
+X cat /tmp/xec-uninstall.log | sed 's/^/    | /'
 t "uninstall: files removed" X sh -c '[ ! -e /usr/bin/xec ] && [ ! -e /usr/bin/menu1 ] && [ ! -e /opt/xe-client ] && [ ! -e /etc/xe-client ] && [ ! -e /etc/init.d/xe-client ]'
 t "uninstall: firewall include + cron removed" X sh -c '! uci -q get firewall.xe_client && ! grep -q xec /etc/crontabs/root'
+t "uninstall from the web: packages it installed are removed too" X sh -c '! opkg status openssh-client | grep -q "^Status:.* installed" && ! opkg status sshpass | grep -q "^Status:.* installed"'
+t "uninstall: web panel gone" sh -c "! ip netns exec xeclan env -u http_proxy curl -s -m 3 http://192.168.8.1:8899/ >/dev/null"
+X pidof xray >/dev/null && fail "uninstall: no xray left" || pass "uninstall: no xray left"
+out=$(lan_get /hello)
+t "uninstall while the tunnel ran: LAN back on the normal internet" sh -c "[ '$out' = HELLO-XE3000 ] && [ '$(lastpeer)' = 192.168.8.100 ]"
 
 printf '\n== RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

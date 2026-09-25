@@ -69,6 +69,13 @@ def http_main(ip, port, logf):
                 self.send_response(204)
                 self.end_headers()
                 return
+            if self.path.startswith("/hosts.txt"):
+                body = b"# SNI list\nwww.example.com\nhttps://good1.example/path\n*.bad-sni.example.org:443\n"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path.startswith("/cdn-cgi/trace"):
                 body = ("ip=%s\nloc=SA\ncolo=JED\n" % self.client_address[0]).encode()
             else:
