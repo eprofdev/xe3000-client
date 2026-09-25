@@ -751,6 +751,60 @@ cmd_add_ssh() { # NAME --host H [--port P] --user U [--pass P|--pass-stdin|--key
     ok "saved SSH profile $n ($P_USER@$P_ADDR:$P_PORT $P_TRANS${P_SNI:+ sni=$P_SNI})"
     after_add "$n"
 }
+# add-proxy NAME --type vless|vmess|trojan --addr H [--port 443] --id UUID|--pass PW|--secret-stdin
+#   [--sec tls|reality|none] [--sni S] [--host H] [--path /p] [--net tcp|ws|grpc|httpupgrade|xhttp]
+#   [--flow xtls-rprx-vision] [--fp chrome] [--alpn h2,http/1.1] [--pcs SHA256] [--vcn NAME]
+#   [--pbk KEY --sid ID --spx / --pqv KEY] [--enc none|auto|...] [--svc NAME] [--mode auto] [--remark R]
+# Editing an existing NAME keeps its id/password/pqv/encryption when those are not given.
+cmd_add_proxy() {
+    n=${1:-}; shift 2>/dev/null
+    match "$RE_NAME" "$n" || die "usage: xec add-proxy NAME --type vless|vmess|trojan --addr HOST --id UUID (or --pass PW) [--sec tls] [--sni SNI] [--host HOST] [--net ws] [--path /]"
+    old_id='' old_pqv='' old_enc='' old_type=''
+    if prof_exists "$n"; then load_prof "$n"; old_type=$P_TYPE old_id=$P_UUID old_pqv=$P_PQV old_enc=$P_ENC; fi
+    prof_clear; P_PORT=443; P_NET=tcp; P_SEC=tls; id=''
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --type) P_TYPE=$2; shift ;;
+            --addr) P_ADDR=$2; shift ;;
+            --port) P_PORT=$2; shift ;;
+            --id | --pass) id=$2; shift ;;
+            --secret-stdin) IFS= read -r id ;;
+            --sec) P_SEC=$2; shift ;;
+            --sni) P_SNI=$2; shift ;;
+            --host) P_HOST=$2; shift ;;
+            --path) P_PATH=$2; shift ;;
+            --net) P_NET=$2; shift ;;
+            --flow) P_FLOW=$2; shift ;;
+            --fp) P_FP=$2; shift ;;
+            --alpn) P_ALPN=$2; shift ;;
+            --pcs) P_PCS=$2; shift ;;
+            --vcn) P_VCN=$2; shift ;;
+            --pbk) P_PBK=$2; shift ;;
+            --sid) P_SID=$2; shift ;;
+            --spx) P_SPX=$2; shift ;;
+            --pqv) P_PQV=$2; shift ;;
+            --enc) P_ENC=$2; shift ;;
+            --svc) P_SVC=$2; shift ;;
+            --mode) P_MODE=$2; shift ;;
+            --remark) P_REMARK=$2; shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+        shift
+    done
+    match 'vless|vmess|trojan' "$P_TYPE" || die "--type vless|vmess|trojan"
+    if [ -z "$id" ] && [ "$old_type" = "$P_TYPE" ]; then id=$old_id; fi
+    [ -n "$id" ] || die "missing --id (VLESS/VMess UUID) or --pass (Trojan password)"
+    P_UUID=$id
+    [ -n "$P_PQV" ] || { [ "$old_type" = "$P_TYPE" ] && P_PQV=$old_pqv; }
+    # keep the old encryption setting only for the same protocol
+    [ -n "$P_ENC" ] || { [ "$old_type" = "$P_TYPE" ] && P_ENC=$old_enc; }
+    case $P_TYPE in vless) [ -n "$P_ENC" ] || P_ENC=none ;; vmess) [ -n "$P_ENC" ] || P_ENC=auto ;; esac
+    [ "$P_NET" = grpc ] && [ -z "$P_SVC" ] && [ -n "$P_PATH" ] && { P_SVC=${P_PATH#/}; P_PATH=''; }
+    check_prof || exit 1
+    save_prof "$n"
+    ok "saved profile $n ($P_TYPE $P_NET/$P_SEC $P_ADDR:$P_PORT${P_SNI:+ sni=$P_SNI}${P_HOST:+ host=$P_HOST})"
+    after_add "$n"
+}
 cmd_list() {
     load_conf
     for n in $(prof_list); do
@@ -930,7 +984,7 @@ cgi_status() {
     for n in $(prof_list); do
         load_prof "$n" >/dev/null 2>&1 || continue
         haspw=false; [ -s "$PROF/$n.pass" ] && haspw=true
-        ps="$ps${ps:+,}{\"name\":$(js "$n"),\"type\":$(js "$P_TYPE"),\"addr\":$(js "$P_ADDR"),\"port\":$(js "$P_PORT"),\"sec\":$(js "$P_SEC"),\"net\":$(js "$P_NET"),\"sni\":$(js "$P_SNI"),\"flow\":$(js "$P_FLOW"),\"pq_sig\":$([ -n "$P_PQV" ] && echo true || echo false),\"pq_enc\":$([ "$P_TYPE" = vless ] && [ -n "$P_ENC" ] && [ "$P_ENC" != none ] && echo true || echo false),\"pinned\":$([ -n "$P_PCS" ] && echo true || echo false),\"trans\":$(js "$P_TRANS"),\"user\":$(js "$P_USER"),\"auth\":$(js "$P_AUTH"),\"wshost\":$(js "$P_WSHOST"),\"wspath\":$(js "$P_WSPATH"),\"payload\":$(js "$P_PAYLOAD"),\"haspw\":$haspw,\"remark\":$(js "$P_REMARK")}"
+        ps="$ps${ps:+,}{\"name\":$(js "$n"),\"type\":$(js "$P_TYPE"),\"addr\":$(js "$P_ADDR"),\"port\":$(js "$P_PORT"),\"sec\":$(js "$P_SEC"),\"net\":$(js "$P_NET"),\"sni\":$(js "$P_SNI"),\"flow\":$(js "$P_FLOW"),\"pq_sig\":$([ -n "$P_PQV" ] && echo true || echo false),\"pq_enc\":$([ "$P_TYPE" = vless ] && [ -n "$P_ENC" ] && [ "$P_ENC" != none ] && echo true || echo false),\"pinned\":$([ -n "$P_PCS" ] && echo true || echo false),\"trans\":$(js "$P_TRANS"),\"user\":$(js "$P_USER"),\"auth\":$(js "$P_AUTH"),\"wshost\":$(js "$P_WSHOST"),\"wspath\":$(js "$P_WSPATH"),\"payload\":$(js "$P_PAYLOAD"),\"host\":$(js "$P_HOST"),\"path\":$(js "${P_PATH:-$P_SVC}"),\"fp\":$(js "$P_FP"),\"alpn\":$(js "$P_ALPN"),\"pbk\":$(js "$P_PBK"),\"sid\":$(js "$P_SID"),\"spx\":$(js "$P_SPX"),\"pcs\":$(js "$P_PCS"),\"vcn\":$(js "$P_VCN"),\"mode\":$(js "$P_MODE"),\"haspw\":$haspw,\"remark\":$(js "$P_REMARK")}"
     done
     st=''
     for k in $SKEYS; do eval "v=\$$k"; st="$st${st:+,}\"$k\":$(js "$v")"; done
@@ -959,6 +1013,15 @@ cgi_add_ssh() {
     if [ -n "$pw" ]; then printf '%s\n' "$pw" | run_json cmd_add_ssh "$@" --pass-stdin; exit 0; fi
     [ "$(fv auth)" = pass ] && [ ! -s "$PROF/$n.pass" ] && reply_err "password required"
     run_json cmd_add_ssh "$@"
+}
+cgi_add_proxy() {
+    set -- "$(fv name)"
+    for f in type addr port sec net sni host path flow fp alpn pcs vcn pbk sid spx pqv enc svc mode remark; do
+        v=$(fv "$f"); [ -n "$v" ] && set -- "$@" "--$f" "$v"
+    done
+    id=$(fv id)
+    if [ -n "$id" ]; then printf '%s\n' "$id" | run_json cmd_add_proxy "$@" --secret-stdin; exit 0; fi
+    run_json cmd_add_proxy "$@"
 }
 cmd_cgi() {
     load_conf
@@ -1015,6 +1078,7 @@ cmd_cgi() {
         add) n=$(fv name); if [ -n "$n" ]; then run_json cmd_add "$n" "$(fv link)"; else run_json cmd_add "$(fv link)"; fi ;;
         import) fv links | run_json cmd_import; exit 0 ;;
         addssh) cgi_add_ssh ;;
+        addproxy) cgi_add_proxy ;;
         use) run_json cmd_use "$(fv name)" ;;
         del) run_json cmd_del "$(fv name)" ;;
         set) run_json cmd_set "$(fv key)" "$(fv value)" ;;
@@ -1194,6 +1258,21 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
   <label>الاسم (اختياري لرابط واحد)</label><input id="a-name" placeholder="myserver">
   <label>الرابط / الروابط</label><textarea id="a-link" placeholder="vless://  vmess://  trojan://  ssh://"></textarea><br><br>
   <button class="btn" id="a-go">حفظ</button></div>
+ <div class="card" id="px-card"><h3>إضافة يدوية: VLESS / VMess / Trojan</h3>
+  <div class="row"><div><label>الاسم</label><input id="x-name" placeholder="myvps"></div><div><label>ملاحظة</label><input id="x-remark"></div></div>
+  <div class="row"><div><label>البروتوكول</label><select id="x-type"><option value="vless">VLESS</option><option value="vmess">VMess</option><option value="trojan">Trojan</option></select></div>
+   <div><label>النقل (Network)</label><select id="x-net"><option value="tcp">TCP (raw)</option><option value="ws">WebSocket</option><option value="grpc">gRPC</option><option value="httpupgrade">HTTPUpgrade</option><option value="xhttp">XHTTP</option></select></div></div>
+  <div class="row"><div><label>عنوان السيرفر (دومين أو IP)</label><input id="x-addr"></div><div><label>المنفذ</label><input id="x-port" value="443"></div></div>
+  <label id="x-idl">UUID</label><input id="x-id" type="password" autocomplete="off" placeholder="عند التعديل: اتركه فارغاً للإبقاء على المحفوظ">
+  <div class="row"><div><label>الأمان</label><select id="x-sec"><option value="tls">TLS</option><option value="reality">REALITY</option><option value="none">بدون (none)</option></select></div>
+   <div><label>بصمة المتصفح (fp)</label><select id="x-fp"><option>chrome</option><option>firefox</option><option>safari</option><option>ios</option><option>android</option><option>edge</option><option>randomized</option></select></div></div>
+  <div class="row"><div><label>SNI (Bug host / serverName)</label><input id="x-sni" placeholder="bug.example.com"></div><div id="x-hostw"><label>Host (ترويسة WS / HTTP)</label><input id="x-hosth" placeholder="cdn.example.com"></div></div>
+  <div class="row" id="x-pathw"><div><label id="x-pathl">المسار (path)</label><input id="x-path" placeholder="/"></div><div><label>ALPN (اختياري)</label><input id="x-alpn" placeholder="h2,http/1.1"></div></div>
+  <div class="row" id="x-vlessw"><div><label>Flow</label><select id="x-flow"><option value="">بدون</option><option value="xtls-rprx-vision">xtls-rprx-vision (XTLS)</option></select></div><div><label>VLESS encryption</label><input id="x-enc" placeholder="none"></div></div>
+  <div id="x-realw"><div class="row"><div><label>Public key (pbk)</label><input id="x-pbk"></div><div><label>Short ID (sid)</label><input id="x-sid"></div></div>
+   <div class="row"><div><label>SpiderX (spx)</label><input id="x-spx" placeholder="/"></div><div><label>ML-DSA-65 (pqv، اختياري)</label><input id="x-pqv" placeholder="اتركه فارغاً للإبقاء"></div></div></div>
+  <div class="row" id="x-tlsw"><div><label>بصمة شهادة السيرفر pcs (للشهادة الموقعة ذاتياً)</label><input id="x-pcs" placeholder="SHA-256 hex"></div><div><label>vcn (اسم الشهادة، اختياري)</label><input id="x-vcn"></div></div><br>
+  <button class="btn" id="x-go">حفظ</button></div>
  <div class="card"><h3>خادم SSH</h3>
   <div class="row"><div><label>الاسم</label><input id="h-name" placeholder="ssh1"></div><div><label>ملاحظة</label><input id="h-remark"></div></div>
   <div class="row"><div><label>الخادم (دومين أو IP)</label><input id="h-host"></div><div><label>المنفذ</label><input id="h-port" value="22"></div></div>
@@ -1236,8 +1315,11 @@ function hb(b){var u=["B","KB","MB","GB","TB"],i=0;b=+b||0;while(b>=1024&&i<4){b
 function toast(m,bad){var t=$("toast");t.textContent=m;t.style.borderColor=bad?"var(--bad)":"var(--line)";t.style.display="block";clearTimeout(t._t);t._t=setTimeout(function(){t.style.display="none"},bad?9000:5000)}
 function api(a,data){
   var o={credentials:"same-origin"},u="cgi-bin/api";
-  if(data){var p=new URLSearchParams();p.append("a",a);p.append("csrf",CSRF);for(var k in data)p.append(k,data[k]);o.method="POST";o.body=p}else u+="?a="+a;
-  return fetch(u,o).then(function(r){if(r.status==401){showLogin();throw new Error("auth")}return r.json()})
+  if(data){var p=new URLSearchParams();p.append("a",a);p.append("csrf",CSRF);for(var k in data)if(k!="_r")p.append(k,data[k]);o.method="POST";o.body=p}else u+="?a="+a;
+  return fetch(u,o).then(function(r){if(r.status==401){showLogin();throw new Error("auth")}return r.json()}).then(function(j){
+    // stale token (e.g. the page was open during an update): fetch a fresh one and retry once
+    if(data&&j&&!j.ok&&/CSRF/.test(j.msg||"")&&!data._r){return fetch("cgi-bin/api?a=csrf",{credentials:"same-origin"}).then(function(r){return r.json()}).then(function(c){if(!c.ok)return j;CSRF=c.csrf;data._r=1;return api(a,data)})}
+    return j})
 }
 function act(a,data,btn){if(btn)btn.disabled=true;toast("…");return api(a,data||{}).then(function(j){toast(j.msg||(j.ok?"OK":"error"),!j.ok);if(btn)btn.disabled=false;load();return j}).catch(function(e){if(btn)btn.disabled=false;if(e.message!="auth")toast(String(e),true)})}
 function showLogin(){$("app").classList.add("hide");$("login").classList.remove("hide");$("lp").focus()}
@@ -1254,15 +1336,35 @@ function load(){api("status").then(function(j){S=j;$("lo").classList.toggle("hid
   $("s-act").textContent=j.active||"-";$("s-up").textContent=hb(j.up);$("s-dn").textContent=hb(j.down);$("s-xv").textContent=j.xray||"-";
   $("s-rt").textContent=j.settings.ROUTE=="all"?"كل الأجهزة ("+j.lan_if+")":"وكيل فقط";
   $("s-px").innerHTML='SOCKS5: <code>'+esc(j.lan_ip)+':'+esc(j.settings.SOCKS_PORT)+'</code> — HTTP: <code>'+esc(j.lan_ip)+':'+esc(j.settings.HTTP_PORT)+'</code><br>عند تفعيل "توجيه كل الأجهزة" لا تحتاج الأجهزة لأي إعداد.';
-  var h="";j.profiles.forEach(function(p){h+="<tr><td>"+(p.name==j.active?'<span class="badge b">●</span> ':"")+esc(p.name)+(p.remark?'<br><small class="mut">'+esc(p.remark)+"</small>":"")+"</td><td>"+kind(p)+"</td><td><span class=addr>"+esc(p.addr)+":"+esc(p.port)+"</span>"+(p.sni?'<br><small class="mut">SNI: '+esc(p.sni)+"</small>":"")+'</td><td><button class="btn" data-u="'+esc(p.name)+'">استخدام</button><button class="btn sec" data-p="'+esc(p.name)+'">اختبار</button>'+(p.type=="ssh"?'<button class="btn sec" data-e="'+esc(p.name)+'">تعديل</button>':"")+'<button class="btn dng" data-d="'+esc(p.name)+'">حذف</button></td></tr>'});
+  var h="";j.profiles.forEach(function(p){h+="<tr><td>"+(p.name==j.active?'<span class="badge b">●</span> ':"")+esc(p.name)+(p.remark?'<br><small class="mut">'+esc(p.remark)+"</small>":"")+"</td><td>"+kind(p)+"</td><td><span class=addr>"+esc(p.addr)+":"+esc(p.port)+"</span>"+(p.sni?'<br><small class="mut">SNI: '+esc(p.sni)+"</small>":"")+'</td><td><button class="btn" data-u="'+esc(p.name)+'">استخدام</button><button class="btn sec" data-p="'+esc(p.name)+'">اختبار</button>'+'<button class="btn sec" data-e="'+esc(p.name)+'">تعديل</button>'+'<button class="btn dng" data-d="'+esc(p.name)+'">حذف</button></td></tr>'});
   $("pl").innerHTML=h||'<tr><td colspan=4 class="mut">لا توجد خوادم بعد — من "إضافة"</td></tr>';
   $("pl").querySelectorAll("[data-u]").forEach(function(b){b.onclick=function(){act("use",{name:b.dataset.u},b)}});
   $("pl").querySelectorAll("[data-p]").forEach(function(b){b.onclick=function(){act("probe",{name:b.dataset.p},b)}});
   $("pl").querySelectorAll("[data-d]").forEach(function(b){b.onclick=function(){if(confirm("حذف "+b.dataset.d+"؟"))act("del",{name:b.dataset.d},b)}});
-  $("pl").querySelectorAll("[data-e]").forEach(function(b){b.onclick=function(){editSsh(b.dataset.e)}});
+  $("pl").querySelectorAll("[data-e]").forEach(function(b){b.onclick=function(){var p=S.profiles.filter(function(x){return x.name==b.dataset.e})[0];if(p&&p.type=="ssh")editSsh(b.dataset.e);else editProxy(b.dataset.e)}});
 }).catch(function(){})}
 $("exb").onclick=function(){var b=this;b.disabled=true;api("exitinfo",{}).then(function(j){b.disabled=false;if(!j.ok)return toast(j.msg,true);$("ex").classList.remove("hide");$("e-ip").textContent=j.ip||"-";$("e-loc").textContent=j.loc||"-";$("e-colo").textContent=j.colo||"-";$("e-ms").textContent=j.ms+" ms"}).catch(function(){b.disabled=false})};
 $("a-go").onclick=function(){var l=$("a-link").value.trim();if(!l)return;var many=l.split(/\n/).filter(function(x){return x.trim()}).length>1;(many?act("import",{links:l},this):act("add",{name:$("a-name").value.trim(),link:l},this)).then(function(j){if(j&&j.ok){$("a-link").value="";$("a-name").value=""}})};
+function pxFields(){var t=$("x-type").value,n=$("x-net").value,sc=$("x-sec").value;
+  $("x-idl").textContent=t=="trojan"?"كلمة مرور Trojan":"UUID";
+  if(t=="vmess"&&sc=="reality"){$("x-sec").value="tls";sc="tls"}
+  $("x-sec").querySelector('[value="reality"]').disabled=(t=="vmess");
+  $("x-vlessw").classList.toggle("hide",t!="vless");$("x-realw").classList.toggle("hide",sc!="reality");$("x-tlsw").classList.toggle("hide",sc!="tls");
+  $("x-hostw").classList.toggle("hide",n=="tcp"||n=="grpc");$("x-pathl").textContent=n=="grpc"?"serviceName":"المسار (path)";
+  if(n!="tcp")$("x-flow").value=""}
+["x-type","x-net","x-sec"].forEach(function(i){$(i).onchange=pxFields});pxFields();
+function editProxy(n){var p=S.profiles.filter(function(x){return x.name==n})[0];if(!p)return;
+  $("x-name").value=p.name;$("x-remark").value=p.remark;$("x-type").value=p.type;$("x-net").value=p.net||"tcp";$("x-addr").value=p.addr;$("x-port").value=p.port;$("x-id").value="";
+  $("x-sec").value=p.sec||"tls";$("x-fp").value=p.fp||"chrome";$("x-sni").value=p.sni;$("x-hosth").value=p.host;$("x-path").value=p.path;$("x-alpn").value=p.alpn;
+  $("x-flow").value=p.flow;$("x-enc").value="";$("x-pbk").value=p.pbk;$("x-sid").value=p.sid;$("x-spx").value=p.spx;$("x-pqv").value="";$("x-pcs").value=p.pcs;$("x-vcn").value=p.vcn;
+  pxFields();document.querySelector('#nav [data-t="ad"]').click();$("px-card").scrollIntoView()}
+$("x-go").onclick=function(){var d={name:$("x-name").value.trim(),remark:$("x-remark").value.trim(),type:$("x-type").value,net:$("x-net").value,addr:$("x-addr").value.trim(),port:$("x-port").value.trim(),id:$("x-id").value.trim(),sec:$("x-sec").value,fp:$("x-fp").value,sni:$("x-sni").value.trim(),alpn:$("x-alpn").value.trim()};
+  var t=d.type,n=d.net;if(n!="tcp"&&n!="grpc")d.host=$("x-hosth").value.trim();if(n=="grpc")d.svc=$("x-path").value.trim().replace(/^\//,"");else if(n!="tcp")d.path=$("x-path").value.trim();
+  if(t=="vless"){d.flow=$("x-flow").value;d.enc=$("x-enc").value.trim()}
+  if(d.sec=="reality"){d.pbk=$("x-pbk").value.trim();d.sid=$("x-sid").value.trim();d.spx=$("x-spx").value.trim();d.pqv=$("x-pqv").value.trim()}
+  if(d.sec=="tls"){d.pcs=$("x-pcs").value.trim();d.vcn=$("x-vcn").value.trim()}
+  for(var k in d)if(d[k]==="")delete d[k];d.name=d.name||"";
+  act("addproxy",d,this).then(function(j){if(j&&j.ok)$("x-id").value=""})};
 function sshFields(){var t=$("h-trans").value;$("h-tlsf").classList.toggle("hide",!(t=="tls"||t=="wss"));$("h-wsf").classList.toggle("hide",!(t=="ws"||t=="wss"));$("h-pw").classList.toggle("hide",$("h-auth").value!="pass")}
 $("h-trans").onchange=sshFields;$("h-auth").onchange=sshFields;sshFields();
 function editSsh(n){var p=S.profiles.filter(function(x){return x.name==n})[0];if(!p)return;$("h-name").value=p.name;$("h-remark").value=p.remark;$("h-host").value=p.addr;$("h-port").value=p.port;$("h-user").value=p.user;$("h-auth").value=p.auth||"pass";$("h-trans").value=p.trans||"direct";$("h-sni").value=p.sni;$("h-wshost").value=p.wshost;$("h-wspath").value=p.wspath;$("h-payload").value=p.payload;$("h-pass").value="";sshFields();document.querySelector('#nav [data-t="ad"]').click()}
@@ -1472,6 +1574,34 @@ menu_ssh() {
     if [ -n "$REPLY" ]; then printf '%s\n' "$REPLY" | (cmd_add_ssh "$@" --pass-stdin); else (cmd_add_ssh "$@" --key) && ssh_key; fi
     return 0
 }
+# menu_proxy - VLESS / VMess / Trojan by hand (SNI = bug host, Host = WS/HTTP host header)
+menu_proxy() {
+    ask "name: " || return 0; n=$REPLY
+    ask "protocol vless|vmess|trojan [vless]: " || return 0; t=${REPLY:-vless}
+    ask "server address: " || return 0; h=$REPLY
+    ask "port [443]: " || return 0; p=${REPLY:-443}
+    if [ "$t" = trojan ]; then ask "Trojan password: " || return 0; else ask "UUID: " || return 0; fi; id=$REPLY
+    ask "network tcp|ws|grpc|httpupgrade|xhttp [ws]: " || return 0; nt=${REPLY:-ws}
+    ask "security tls|reality|none [tls]: " || return 0; sc=${REPLY:-tls}
+    ask "SNI (bug host) [$h]: " || return 0; sn=${REPLY:-$h}
+    set -- "$n" --type "$t" --addr "$h" --port "$p" --net "$nt" --sec "$sc" --sni "$sn"
+    case $nt in ws | httpupgrade | xhttp)
+        ask "Host header [$sn]: " || return 0; set -- "$@" --host "${REPLY:-$sn}"
+        ask "path [/]: " || return 0; set -- "$@" --path "${REPLY:-/}" ;;
+    grpc) ask "gRPC serviceName: " || return 0; [ -n "$REPLY" ] && set -- "$@" --svc "$REPLY" ;;
+    esac
+    if [ "$t" = vless ] && [ "$nt" = tcp ]; then
+        ask "XTLS Vision flow? y/n [y]: " || return 0; [ "${REPLY:-y}" = y ] && set -- "$@" --flow xtls-rprx-vision
+    fi
+    if [ "$sc" = reality ]; then
+        ask "REALITY public key (pbk): " || return 0; set -- "$@" --pbk "$REPLY"
+        ask "short id (sid, empty = none): " || return 0; [ -n "$REPLY" ] && set -- "$@" --sid "$REPLY"
+    elif [ "$sc" = tls ]; then
+        ask "self-signed certificate? SHA-256 pin (pcs), empty = normal: " || return 0; [ -n "$REPLY" ] && set -- "$@" --pcs "$REPLY"
+    fi
+    printf '%s\n' "$id" | (cmd_add_proxy "$@" --secret-stdin)
+    return 0
+}
 cmd_menu() {
     while true; do
         say ""
@@ -1481,6 +1611,7 @@ cmd_menu() {
         say " 1) add link: VLESS / VMess / Trojan / SSH"
         say " 2) add SSH server (direct / TLS / WS / WSS)"
         say "13) add SSH WSS (WebSocket + TLS + SNI)"
+        say "14) add VLESS / VMess / Trojan manually (SNI, Host, path ...)"
         say " 3) choose active profile       4) test all profiles"
         say " 5) start / restart tunnel      6) stop tunnel"
         say " 7) test tunnel + exit IP       8) settings"
@@ -1493,6 +1624,7 @@ cmd_menu() {
                if [ -n "$n" ]; then (cmd_add "$n" "$REPLY"); else (cmd_add "$REPLY"); fi ;;
             2) menu_ssh '' ;;
             13) menu_ssh wss ;;
+            14) menu_proxy ;;
             3) cmd_list; ask "profile name: " || return 0; (cmd_use "$REPLY") ;;
             4) cmd_ping ;;
             5) (cmd_start) ;;
@@ -1528,6 +1660,9 @@ XE3000 CLIENT $XEC_VERSION - router -> your server (VLESS REALITY / SSH)
   xec add [NAME] 'vless://UUID@HOST:443?security=reality&sni=...&pbk=...&sid=...&flow=xtls-rprx-vision&fp=chrome[&pqv=...]'
   xec add [NAME] 'vmess://BASE64-JSON'   'trojan://PASSWORD@HOST:443?security=tls&sni=...[&type=ws&path=/..][&pcs=CERT_SHA256]'
   xec add [NAME] 'ssh://USER:PASS@HOST:443?transport=tls|ws|wss&sni=BUGHOST[&host=WSHOST&path=/]'
+  xec add-proxy NAME --type vless|vmess|trojan --addr H [--port 443] --id UUID|--pass PW [--sec tls|reality|none]
+              [--sni SNI] [--host HOST] [--net tcp|ws|grpc|httpupgrade|xhttp] [--path /] [--flow xtls-rprx-vision]
+              [--fp chrome] [--pcs CERT_SHA256] [--pbk KEY --sid ID --pqv KEY] [--enc ...] [--alpn h2]
   xec add-ssh NAME --host H --user U [--port 22] [--pass P | --pass-stdin | --key]
               [--transport direct|tls|ws|wss] [--sni S] [--ws-host H] [--ws-path /] [--payload STR]
   xec import < links.txt     xec list | use NAME | del NAME | show NAME
@@ -1547,6 +1682,7 @@ case $cmd in
     uninstall) cmd_uninstall "$@" ;;
     add) cmd_add "$@" ;;
     add-ssh) cmd_add_ssh "$@" ;;
+    add-proxy) cmd_add_proxy "$@" ;;
     import) cmd_import ;;
     list | ls) cmd_list ;;
     use) cmd_use "$@" ;;

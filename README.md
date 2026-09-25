@@ -58,6 +58,8 @@ wget -O /tmp/xec.sh https://raw.githubusercontent.com/eprofdev/xe3000-client/mai
 menu1                                 # القائمة التفاعلية (أو: xec menu)
 xec add myvps 'vless://UUID@1.2.3.4:443?security=reality&sni=www.microsoft.com&pbk=KEY&sid=ab12&flow=xtls-rprx-vision&fp=chrome'
 xec add 'ssh://user:pass@1.2.3.4:443?transport=tls&sni=bug.host.com#SSH-TLS'
+xec add-proxy vps1 --type vless --addr 1.2.3.4 --port 443 --id UUID --net ws --path /ws --sec tls --sni bug.host.com --host cdn.host.com
+xec add-proxy tj1 --type trojan --addr 1.2.3.4 --pass PASSWORD --net ws --path /tj --sni bug.host.com --host cdn.host.com
 xec add-ssh ws1 --host 1.2.3.4 --port 80 --user u --pass-stdin --transport ws --ws-host bug.host.com
 xec add-ssh k1 --host 1.2.3.4 --user root --key && xec ssh-key   # أضف المفتاح المطبوع إلى authorized_keys في السيرفر
 xec start | stop | status | test | test myvps | ping
@@ -66,6 +68,12 @@ xec set KILLSWITCH 0 | xec set FAILOVER 1 | xec route off | xec bypass add 192.1
 xec web auth on|off | xec web password | xec update-xray | xec logs | xec export > backup.txt | xec restore backup.txt
 xec uninstall [--purge]
 ```
+
+**إضافة يدوية بدون رابط (SNI وHost):**
+- من لوحة الويب: "إضافة" ← "إضافة يدوية: VLESS / VMess / Trojan".
+- من `menu1`: الخيار **14**.
+- فيها حقل **SNI** (الـ Bug host أو serverName في TLS) وحقل **Host** (ترويسة WebSocket / HTTP)، والمسار، ونوع النقل، وFlow (XTLS Vision)، وREALITY، وبصمة الشهادة `pcs`.
+- زر **تعديل** بجانب كل سيرفر يعيد فتح النموذج بقيمه. اترك UUID أو كلمة المرور فارغة للإبقاء على المحفوظة.
 
 **Payload** لـ WebSocket (اختياري): `GET [path] HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]`
 (المتغيرات المتاحة: `[host]` و`[path]` و`[sni]` و`[crlf]` و`[lf]` و`[cr]`)

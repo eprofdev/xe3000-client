@@ -274,6 +274,17 @@ done
 r=$(X xec test tjbad); echo "    | $r"; case $r in *FAIL*) pass "wrong Trojan password fails" ;; *) fail "wrong Trojan password worked" ;; esac
 r=$(X xec test vmbadpin); echo "    | $r"; case $r in *FAIL*) pass "wrong certificate pin (pcs) is refused" ;; *) fail "wrong pcs worked" ;; esac
 
+step "manual entry (SNI + Host without a link)"
+X xec add-proxy tjm --type trojan --addr 198.51.100.20 --port 7444 --pass Tr0jan-pass --net ws --path /tj \
+    --sni www.example.com --host www.example.com --pcs "$PCS" | sed 's/^/    | /'
+r=$(X xec test tjm); echo "    | $r"; case $r in *OK*) pass "xec add-proxy: Trojan WS TLS with SNI + Host" ;; *) fail "xec add-proxy Trojan" ;; esac
+X xec add-proxy tjm --type trojan --addr 198.51.100.20 --port 7444 --net ws --path /tj --sni www.example.com --host www.example.com --pcs "$PCS" >/dev/null
+r=$(X xec test tjm); echo "    | $r"; case $r in *OK*) pass "edit without re-typing the password keeps it" ;; *) fail "edit lost the password" ;; esac
+printf '14\nmenuvm\nvmess\n198.51.100.20\n6443\n%s\nws\ntls\nwww.example.com\nwww.example.com\n/vm\n%s\n0\n' "$UUID" "$PCS" |
+    OW_EXTRA_ENV="NO_COLOR=1" ow_exec menu1 >"$W/menu14.out" 2>&1
+grep -E 'saved profile|\[x\]' "$W/menu14.out" | sed 's/^/    | /'
+r=$(X xec test menuvm); echo "    | $r"; case $r in *OK*) pass "menu1 option 14: VMess WS TLS with SNI + Host" ;; *) fail "menu1 option 14" ;; esac
+
 step "profiles: SSH (direct / TLS+SNI / WebSocket / WebSocket+TLS / key)"
 X xec add-ssh sdirect --host 198.51.100.30 --port 2222 --user xectest --pass 'Pa55-w0rd' | sed 's/^/    | /'
 X xec add stls 'ssh://xectest:Pa55-w0rd@198.51.100.30:443?transport=tls&sni=bug.example.com#SSH%20TLS' | sed 's/^/    | /'
@@ -333,7 +344,7 @@ t "wrong password refused" sh -c "ip netns exec xeclan env -u HTTP_PROXY -u http
 CS=$(api -d 'a=login&pass=Web-pass-123' http://192.168.8.1:8899/cgi-bin/api | python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf"])')
 t "login -> session + CSRF token" test ${#CS} = 32
 api "http://192.168.8.1:8899/cgi-bin/api?a=status" >"$W/status.json"
-t "status JSON valid, running, 17 profiles" python3 -c "import json; j=json.load(open('$W/status.json')); assert j['running'] and j['active']=='A' and len(j['profiles'])==17, j"
+t "status JSON valid, running, 19 profiles" python3 -c "import json; j=json.load(open('$W/status.json')); assert j['running'] and j['active']=='A' and len(j['profiles'])==19, j"
 t "status never contains passwords" sh -c "! grep -q 'Pa55-w0rd' '$W/status.json'"
 t "POST without CSRF refused" sh -c "ip netns exec xeclan env -u HTTP_PROXY -u http_proxy curl -s -b '$J' -d 'a=set&key=LOGLEVEL&value=info' http://192.168.8.1:8899/cgi-bin/api | grep -q 'CSRF'"
 r=$(api -d "a=set&key=LOGLEVEL&value=info&csrf=$CS" http://192.168.8.1:8899/cgi-bin/api); echo "    | $r"
@@ -343,6 +354,10 @@ t "add link via web" X test -f /etc/xe-client/profiles/webA.conf
 r=$(api -d "a=addssh&name=webssh&host=198.51.100.30&port=443&user=xectest&auth=pass&trans=tls&sni=bug.example.com&csrf=$CS" --data-urlencode 'pass=Pa55-w0rd' http://192.168.8.1:8899/cgi-bin/api); echo "    | $r"
 t "add SSH via web (password stored)" X grep -qx 'Pa55-w0rd' /etc/xe-client/profiles/webssh.pass
 r=$(api -d "a=probe&name=webssh&csrf=$CS" http://192.168.8.1:8899/cgi-bin/api); echo "    | $r"
+r=$(api -d "a=addproxy&name=webvl&type=vless&addr=198.51.100.20&port=4443&net=xhttp&sec=reality&sni=www.example.com&path=%2Fxh&pbk=$PBK&sid=a1b2c3d4&fp=chrome&csrf=$CS" --data-urlencode "id=$UUID" http://192.168.8.1:8899/cgi-bin/api); echo "    | $r"
+r=$(api -d "a=probe&name=webvl&csrf=$CS" http://192.168.8.1:8899/cgi-bin/api); echo "    | $r"
+t "web manual form: VLESS XHTTP REALITY with SNI" sh -c "echo '$r' | grep -q 'OK'"
+api -d "a=del&name=webvl&csrf=$CS" http://192.168.8.1:8899/cgi-bin/api >/dev/null
 t "test profile via web" sh -c "echo '$r' | grep -q 'OK'"
 r=$(api -d "a=exitinfo&csrf=$CS" http://192.168.8.1:8899/cgi-bin/api); echo "    | $r"
 t "exit IP / Cloudflare station via web" python3 -c "import json; j=json.loads('''$r'''); assert j['ok'] and j['colo']=='JED'"
