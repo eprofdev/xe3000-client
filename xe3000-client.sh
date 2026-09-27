@@ -122,7 +122,8 @@ b64dec() {
 defaults() {
     ACTIVE='' ROUTE=all DNS_TUNNEL=1 DNS_SERVER=1.1.1.1 BLOCK_QUIC=1 BLOCK_V6=1
     KILLSWITCH=0 FAILOVER=1 BYPASS_SRC='' BYPASS_DST='' LAN_IF='' LAN_IP=''
-    SOCKS_PORT=10808 HTTP_PORT=10809 REDIR_PORT=10810 DNS_PORT=10853 API_PORT=10085 SSH_SOCKS=10811
+    SOCKS_PORT=10808 HTTP_PORT=10809 REDIR_PORT=10810 DNS_PORT=10853 API_PORT=10085 SSH_SOCKS=10811 TPROXY_PORT=10812
+    ENGINE=auto OBS_INTERVAL=60s AUTO_POOL=''
     WEB=1 WEB_PORT=8899 WEB_AUTH=0 LOGLEVEL=warning SNIFF=1
     CHECK_URL=https://www.gstatic.com/generate_204
     TRACE_URL=https://www.cloudflare.com/cdn-cgi/trace
@@ -333,9 +334,10 @@ pick_name() {
     if [ -n "$(printf '%s' "$1" | tr -cd 'A-Za-z0-9')" ]; then name_from "$1"; else name_from "$2"; fi
 }
 # ------------------------------------------------------------ xray config
-outbound_json() { # uses P_*, $1 = ssh socks port
+outbound_json() { # uses P_*, $1 = ssh socks port, $2 = tag (default proxy)
+    otag=${2:-proxy}
     if [ "$P_TYPE" = ssh ]; then
-        printf '{"tag":"proxy","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":%s}]}}' "$1"
+        printf '{"tag":"%s","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":%s}]}}' "$otag" "$1"
         return
     fi
     net=$P_NET; [ "$net" = tcp ] && net=raw
@@ -366,20 +368,38 @@ outbound_json() { # uses P_*, $1 = ssh socks port
     esac
     case $P_TYPE in
         vmess)
-            printf '{"tag":"proxy","protocol":"vmess","settings":{"vnext":[{"address":%s,"port":%s,"users":[{"id":%s,"security":%s}]}]},"streamSettings":{%s}}' \
-                "$(js "$P_ADDR")" "$P_PORT" "$(js "$P_UUID")" "$(js "$P_ENC")" "$s" ;;
+            printf '{"tag":"%s","protocol":"vmess","settings":{"vnext":[{"address":%s,"port":%s,"users":[{"id":%s,"security":%s}]}]},"streamSettings":{%s}}' \
+                "$otag" "$(js "$P_ADDR")" "$P_PORT" "$(js "$P_UUID")" "$(js "$P_ENC")" "$s" ;;
         trojan)
-            printf '{"tag":"proxy","protocol":"trojan","settings":{"servers":[{"address":%s,"port":%s,"password":%s}]},"streamSettings":{%s}}' \
-                "$(js "$P_ADDR")" "$P_PORT" "$(js "$P_UUID")" "$s" ;;
+            printf '{"tag":"%s","protocol":"trojan","settings":{"servers":[{"address":%s,"port":%s,"password":%s}]},"streamSettings":{%s}}' \
+                "$otag" "$(js "$P_ADDR")" "$P_PORT" "$(js "$P_UUID")" "$s" ;;
         *)
-            printf '{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":%s,"port":%s,"users":[%s]}]},"streamSettings":{%s}}' \
-                "$(js "$P_ADDR")" "$P_PORT" "$u" "$s" ;;
+            printf '{"tag":"%s","protocol":"vless","settings":{"vnext":[{"address":%s,"port":%s,"users":[%s]}]},"streamSettings":{%s}}' \
+                "$otag" "$(js "$P_ADDR")" "$P_PORT" "$u" "$s" ;;
     esac
 }
 # gen_xray NAME OUT [PROBE_PORT PROBE_SSH_PORT]
+# auto_pool - the profiles the "auto" balancer may use (not SSH: it needs its own ssh process)
+auto_pool() {
+    # AUTO_POOL (set by "xec best"): only the servers that passed the tests
+    if [ -n "${AUTO_POOL:-}" ]; then
+        for n in $AUTO_POOL; do prof_exists "$n" && ! grep -q "^P_TYPE='ssh'" "$PROF/$n.conf" && printf '%s\n' "$n"; done
+        return 0
+    fi
+    for n in $(prof_list); do
+        t=$(sed -n "s/^P_TYPE='\(.*\)'/\1/p" "$PROF/$n.conf")
+        [ "$t" = ssh ] || printf '%s\n' "$n"
+    done
+}
 gen_xray() {
     load_conf
-    load_prof "$1" || return 1
+    is_auto=0
+    if [ "$1" = auto ]; then
+        [ -n "$(auto_pool)" ] || { err "auto needs at least one VLESS/VMess/Trojan server"; return 1; }
+        prof_clear; P_TYPE=auto; P_NAME=auto; is_auto=1
+    else
+        load_prof "$1" || return 1
+    fi
     out=$2
     mkdir -p "$(dirname "$out")" "$LOGD"
     if [ -n "${3:-}" ]; then
@@ -412,16 +432,40 @@ gen_xray() {
         printf '{"tag":"socks-lan","listen":"%s","port":%s,"protocol":"socks","settings":{"udp":true},%s},\n' "$LAN_IP" "$SOCKS_PORT" "$sniff"
         printf '{"tag":"http-lan","listen":"%s","port":%s,"protocol":"http","settings":{}},\n' "$LAN_IP" "$HTTP_PORT"
         printf '{"tag":"redir-in","listen":"%s","port":%s,"protocol":"dokodemo-door","settings":{"network":"tcp","followRedirect":true},%s},\n' "$LAN_IP" "$REDIR_PORT" "$sniff"
+        [ "$(eff_engine)" = tproxy ] &&
+            printf '{"tag":"tproxy-in","listen":"%s","port":%s,"protocol":"dokodemo-door","settings":{"network":"tcp,udp","followRedirect":true},"streamSettings":{"sockopt":{"tproxy":"tproxy"}},%s},\n' "$LAN_IP" "$TPROXY_PORT" "$(printf '%s' "$sniff" | sed 's/"tls"\]/"tls","quic"]/')"
         printf '{"tag":"dns-in","listen":"%s","port":%s,"protocol":"dokodemo-door","settings":{"address":"%s","port":53,"network":"tcp,udp"}}\n' "$LAN_IP" "$DNS_PORT" "$DNS_SERVER"
-        printf '],\n"outbounds":[\n%s,\n' "$(outbound_json "$SSH_SOCKS")"
-        printf '{"tag":"dns-out","protocol":"dns","settings":{"network":"tcp","address":"%s","port":53},"streamSettings":{"sockopt":{"dialerProxy":"proxy"}}},\n' "$DNS_SERVER"
+        if [ $is_auto = 1 ]; then
+            # every VLESS/VMess/Trojan server is an outbound; Xray measures them all the
+            # time and sends the traffic through the fastest one that works
+            first='' ob=''
+            for n in $(auto_pool); do
+                load_prof "$n" >/dev/null 2>&1 || continue
+                ob="$ob${ob:+,
+}$(outbound_json "$SSH_SOCKS" "p_$n")"; [ -n "$first" ] || first="p_$n"
+            done
+            printf '],\n"outbounds":[\n%s,\n' "$ob"
+            dproxy=$first
+        else
+            printf '],\n"outbounds":[\n%s,\n' "$(outbound_json "$SSH_SOCKS")"
+            dproxy=proxy
+        fi
+        printf '{"tag":"dns-out","protocol":"dns","settings":{"network":"tcp","address":"%s","port":53},"streamSettings":{"sockopt":{"dialerProxy":"%s"}}},\n' "$DNS_SERVER" "$dproxy"
         printf '{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],\n'
-        printf '"routing":{"domainStrategy":"AsIs","rules":[\n'
+        if [ $is_auto = 1 ]; then
+            printf '"observatory":{"subjectSelector":["p_"],"probeUrl":%s,"probeInterval":"%s","enableConcurrency":true},\n' "$(js "$CHECK_URL")" "$OBS_INTERVAL"
+            printf '"routing":{"domainStrategy":"AsIs","balancers":[{"tag":"best","selector":["p_"],"strategy":{"type":"leastPing"},"fallbackTag":"%s"}],"rules":[\n' "$first"
+            to='"balancerTag":"best"'
+        else
+            printf '"routing":{"domainStrategy":"AsIs","rules":[\n'
+            to='"outboundTag":"proxy"'
+        fi
         printf '{"inboundTag":["dns-in"],"outboundTag":"dns-out"},\n'
-        printf '{"inboundTag":["dns-module"],"outboundTag":"proxy"},\n'
+        printf '{"inboundTag":["dns-module"],%s},\n' "$to"
         [ -n "$by_dom" ] && printf '{"domain":[%s],"outboundTag":"direct"},\n' "$by_dom"
         [ -n "$by_ip" ] && printf '{"ip":[%s],"outboundTag":"direct"},\n' "$by_ip"
-        printf '{"ip":[%s],"outboundTag":"direct"}\n]}}\n' "$direct_ip"
+        printf '{"ip":[%s],"outboundTag":"direct"},\n' "$direct_ip"
+        printf '{"network":"tcp,udp",%s}\n]}}\n' "$to"
     } >"$out"
 }
 
@@ -475,11 +519,71 @@ ws_payload() {
           s=rep(s,"[host]",h); s=rep(s,"[path]",pa); s=rep(s,"[sni]",sn); printf "%s", s }'
 }
 
+# ------------------------------------------------------------------ engine
+# redirect: iptables REDIRECT -> TCP (+ DNS) through the tunnel      (works everywhere)
+# tproxy:   iptables TPROXY   -> TCP + UDP (games, calls, QUIC)       (needs TPROXY support)
+TP_MARK=0x40000/0x40000
+TP_TABLE=144
+tproxy_ok() { # can this router do TPROXY (kernel + iptables extension + ip rule)?
+    command -v iptables >/dev/null 2>&1 || return 1
+    $IPT -t mangle -N XEC_TTEST 2>/dev/null || $IPT -t mangle -F XEC_TTEST 2>/dev/null
+    r=1
+    $IPT -t mangle -A XEC_TTEST -p udp -j TPROXY --on-ip 127.0.0.1 --on-port 9 --tproxy-mark "$TP_MARK" 2>/dev/null &&
+        ip rule add fwmark "$TP_MARK" lookup 145 pref 9998 2>/dev/null && ip rule del fwmark "$TP_MARK" lookup 145 pref 9998 2>/dev/null && r=0
+    $IPT -t mangle -F XEC_TTEST 2>/dev/null; $IPT -t mangle -X XEC_TTEST 2>/dev/null
+    return $r
+}
+# eff_engine - the engine the next start uses
+eff_engine() {
+    [ -n "${ENG_CACHE:-}" ] && { echo "$ENG_CACHE"; return; }
+    case $ACTIVE in auto) t=auto ;; *) t=$(sed -n "s/^P_TYPE='\(.*\)'/\1/p" "$PROF/$ACTIVE.conf" 2>/dev/null) ;; esac
+    # SSH has no UDP: always redirect
+    [ "$t" = ssh ] && { echo redirect; return; }
+    case $ENGINE in
+        redirect) echo redirect ;;
+        tproxy) if tproxy_ok; then echo tproxy; else echo redirect; fi ;;
+        *) if tproxy_ok; then echo tproxy; else echo redirect; fi ;;
+    esac
+}
+engine_install() { # add the TPROXY packages (only what is missing)
+    tproxy_ok && { ok "TPROXY already supported"; return 0; }
+    say "installing TPROXY support ..."
+    opkg update >/tmp/xec-opkg.log 2>&1 || { warn "opkg update failed (internet?)"; return 1; }
+    for pk in iptables-mod-tproxy kmod-ipt-tproxy ip-full; do
+        tproxy_ok && break
+        pkg_ok "$pk" && continue
+        if opkg install "$pk" >>/tmp/xec-opkg.log 2>&1; then
+            grep -qx "$pk" "$ETC/installed-pkgs" 2>/dev/null || echo "$pk" >>"$ETC/installed-pkgs"
+        fi
+    done
+    if tproxy_ok; then ok "TPROXY supported now (TCP + UDP through the tunnel)"; return 0; fi
+    warn "this firmware's kernel has no TPROXY - the redirect engine (TCP + DNS) stays"; return 1
+}
+cmd_engine() {
+    load_conf
+    case ${1:-} in
+        auto | redirect | tproxy) cmd_set ENGINE "$1" ;;
+        install) engine_install ;;
+        check | '') say "setting: $ENGINE | TPROXY supported: $(tproxy_ok && echo yes || echo no) | next start uses: $(eff_engine)" ;;
+        *) die "usage: xec engine [auto|redirect|tproxy|install|check]" ;;
+    esac
+}
+# conflicts - other programs that also redirect the LAN (they fight over the same packets)
+conflicts() {
+    for a in passwall passwall2 openclash homeproxy shadowsocksr v2raya xray_core sing-box mihomo clash; do
+        [ -x "/etc/init.d/$a" ] && "/etc/init.d/$a" enabled 2>/dev/null && printf '%s (enabled) ' "$a"
+    done
+    pgrep -f 'clash|mihomo' >/dev/null 2>&1 && printf 'clash/mihomo (running) '
+    $IPT -t nat -S 2>/dev/null | grep -qiE 'PSW|passwall|openclash|SS_SPEC|V2RAY|XRAY_' && printf 'foreign-nat-rules '
+    $IPT -t mangle -S 2>/dev/null | grep -qiE 'PSW|passwall|openclash|V2RAY|XRAY_' && printf 'foreign-mangle-rules '
+    return 0
+}
+
 # --------------------------------------------------------------- firewall
 IPT="iptables -w"
 IP6T="ip6tables -w"
 fw_off() {
-    for c in "nat PREROUTING XEC_PRE" "filter FORWARD XEC_FWD"; do
+    for c in "nat PREROUTING XEC_PRE" "filter FORWARD XEC_FWD" "mangle PREROUTING XEC_TP"; do
         set -- $c
         while $IPT -t "$1" -D "$2" -i "${LAN_IF:-br-lan}" -j "$3" 2>/dev/null; do :; done
         while $IPT -t "$1" -D "$2" -j "$3" 2>/dev/null; do :; done
@@ -490,6 +594,8 @@ fw_off() {
         while $IP6T -D FORWARD -j XEC_FWD6 2>/dev/null; do :; done
         $IP6T -F XEC_FWD6 2>/dev/null; $IP6T -X XEC_FWD6 2>/dev/null
     fi
+    while ip rule del fwmark "$TP_MARK" lookup "$TP_TABLE" 2>/dev/null; do :; done
+    ip route flush table "$TP_TABLE" 2>/dev/null
     return 0
 }
 fw_on() {
@@ -509,11 +615,29 @@ fw_on() {
     for d in $BYPASS_DST; do
         case $d in *:*) ;; *) $IPT -t nat -A XEC_PRE -d "$d" -j RETURN ;; esac
     done
-    $IPT -t nat -A XEC_PRE -p tcp -j REDIRECT --to-ports "$REDIR_PORT"
+    eng=$(eff_engine)
+    if [ "$eng" = tproxy ]; then
+        # TCP + UDP: mark in mangle, deliver to xray's transparent socket via a local route
+        $IPT -t mangle -N XEC_TP
+        for s in $BYPASS_SRC; do $IPT -t mangle -A XEC_TP -s "$s" -j RETURN; done
+        [ "$DNS_TUNNEL" = 1 ] && $IPT -t mangle -A XEC_TP -p udp --dport 53 -j RETURN && $IPT -t mangle -A XEC_TP -p tcp --dport 53 -j RETURN
+        for d in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4 $BYPASS_DST; do
+            case $d in *:*) ;; *) $IPT -t mangle -A XEC_TP -d "$d" -j RETURN ;; esac
+        done
+        for pr in tcp udp; do
+            $IPT -t mangle -A XEC_TP -p $pr -j TPROXY --on-ip "$LAN_IP" --on-port "$TPROXY_PORT" --tproxy-mark "$TP_MARK"
+        done
+        $IPT -t mangle -I PREROUTING 1 -i "$LAN_IF" -j XEC_TP
+        ip rule add fwmark "$TP_MARK" lookup "$TP_TABLE" pref 9997 2>/dev/null
+        ip route replace local 0.0.0.0/0 dev lo table "$TP_TABLE" 2>/dev/null
+    else
+        $IPT -t nat -A XEC_PRE -p tcp -j REDIRECT --to-ports "$REDIR_PORT"
+    fi
     $IPT -t nat -I PREROUTING 1 -i "$LAN_IF" -j XEC_PRE
     $IPT -t filter -N XEC_FWD
     for s in $BYPASS_SRC; do $IPT -t filter -A XEC_FWD -s "$s" -j RETURN; done
-    [ "$BLOCK_QUIC" = 1 ] && $IPT -t filter -A XEC_FWD -p udp --dport 443 -j REJECT
+    # with TPROXY, UDP 443 (QUIC) goes through the tunnel too - only block it for redirect
+    [ "$BLOCK_QUIC" = 1 ] && [ "$eng" != tproxy ] && $IPT -t filter -A XEC_FWD -p udp --dport 443 -j REJECT
     $IPT -t filter -I FORWARD 1 -i "$LAN_IF" -j XEC_FWD
     if [ "$BLOCK_V6" = 1 ] && $IP6T -S FORWARD >/dev/null 2>&1; then
         $IP6T -N XEC_FWD6 && $IP6T -A XEC_FWD6 -j REJECT && $IP6T -I FORWARD 1 -i "$LAN_IF" -j XEC_FWD6
@@ -543,7 +667,7 @@ port_owner() { netstat -ltnup 2>/dev/null | awk -v p=":$1\$" '$4 ~ p { print $NF
 # (e.g. another Xray panel on 10085); runs while our own xray is stopped
 fix_ports() {
     used=' '
-    for k in SOCKS_PORT HTTP_PORT REDIR_PORT DNS_PORT API_PORT SSH_SOCKS; do
+    for k in SOCKS_PORT HTTP_PORT REDIR_PORT DNS_PORT API_PORT SSH_SOCKS TPROXY_PORT; do
         eval "p=\$$k"; o=$p; i=0
         while { port_busy "$p" || case $used in *" $p "*) true ;; *) false ;; esac; } && [ $i -lt 200 ]; do
             p=$((p + 1)); i=$((i + 1))
@@ -559,18 +683,20 @@ cmd_prepare() { # called by the init script
     load_conf
     mkdir -p "$RUN" "$LOGD"
     rm -f "$RUN/fw-suspended" "$RUN/fails"
-    if [ -z "$ACTIVE" ] || ! prof_exists "$ACTIVE"; then
+    if [ -z "$ACTIVE" ] || { [ "$ACTIVE" != auto ] && ! prof_exists "$ACTIVE"; }; then
         fw_off; log "no active profile - tunnel not started"; return 1
     fi
     [ -x "$XRAY" ] || { log "xray missing"; return 1; }
     fix_ports; load_conf
+    ENG_CACHE=$(eff_engine); export ENG_CACHE
     gen_xray "$ACTIVE" "$RUN/xray.json" || return 1
     if ! "$XRAY" run -test -c "$RUN/xray.json" >"$RUN/test.out" 2>&1; then
         log "xray config test failed: $(tail -n 1 "$RUN/test.out")"; return 1
     fi
     printf 'XEC_TYPE=%s\n' "$P_TYPE" >"$RUN/procd.env"
     fw_on
-    log "starting profile $ACTIVE ($P_TYPE $P_ADDR:$P_PORT)"
+    if [ "$ACTIVE" = auto ]; then log "starting auto: best of $(auto_pool | tr '\n' ' ')(engine $(eff_engine))"
+    else log "starting profile $ACTIVE ($P_TYPE $P_ADDR:$P_PORT, engine $(eff_engine))"; fi
     return 0
 }
 svc() { [ -x "$INIT" ] || die "not installed - run: sh $0 install"; "$INIT" "$1"; }
@@ -579,6 +705,7 @@ restart() { "$1" stop >/dev/null 2>&1; "$1" start; }
 cmd_start() {
     load_conf
     [ -n "$ACTIVE" ] || die "no active profile - add one: xec add NAME 'vless://...'"
+    c=$(conflicts); [ -z "$c" ] || warn "other LAN proxy programs found: $c- they can break this tunnel (turn them off)"
     "$INIT" enable 2>/dev/null
     [ -x "$INIT" ] || die "not installed - run: sh $0 install"
     restart "$INIT"
@@ -588,20 +715,22 @@ cmd_start() {
     if is_running; then
         ok "tunnel running: $ACTIVE"
         # does traffic really pass? never leave the LAN without internet silently
-        r=$(curl_socks "$SOCKS_PORT" "$CHECK_URL")
+        # auto: give Xray's observatory a few seconds for its first measurements
+        tries=2; [ "$ACTIVE" = auto ] && tries=6
+        i=0 r='000 0'
+        while [ $i -lt $tries ]; do
+            r=$(curl_socks "$SOCKS_PORT" "$CHECK_URL"); code_ok "${r%% *}" && break
+            i=$((i + 1)); [ $i -lt $tries ] && sleep 3
+        done
         if code_ok "${r%% *}"; then ok "internet through the server works"
+        elif [ "$KILLSWITCH" = 1 ]; then
+            err "the server does not pass traffic - kill switch ON: the LAN has NO internet until it works"
+            say "  undo: xec stop   |   allow normal internet meanwhile: xec set KILLSWITCH 0   |   details: xec diag"
         else
-            r=$(curl_socks "$SOCKS_PORT" "$CHECK_URL")
-            if code_ok "${r%% *}"; then ok "internet through the server works"
-            elif [ "$KILLSWITCH" = 1 ]; then
-                err "the server does not pass traffic - kill switch ON: the LAN has NO internet until it works"
-                say "  undo: xec stop   |   allow normal internet meanwhile: xec set KILLSWITCH 0   |   details: xec diag"
-            else
-                fw_off; : >"$RUN/fw-suspended"
-                err "the server does not pass traffic - the LAN stays on the normal internet for now"
-                say "  the watchdog switches the LAN to the tunnel as soon as it works. details: xec diag"
-                log "start: $ACTIVE passes no traffic - LAN left on the normal internet"
-            fi
+            fw_off; : >"$RUN/fw-suspended"
+            err "the server does not pass traffic - the LAN stays on the normal internet for now"
+            say "  the watchdog switches the LAN to the tunnel as soon as it works. details: xec diag"
+            log "start: $ACTIVE passes no traffic - LAN left on the normal internet"
         fi
     else
         err "tunnel did not start - reason:"
@@ -677,6 +806,68 @@ cmd_test() {
     [ -n "$t" ] && say "exit IP: $(printf '%s\n' "$t" | sed -n 's/^ip=//p')  country: $(printf '%s\n' "$t" | sed -n 's/^loc=//p')  Cloudflare: $(printf '%s\n' "$t" | sed -n 's/^colo=//p')"
     return 0
 }
+# ------------------------------------------------------------------- best
+# xec best [--apply] [--install] [--single]
+#   1 router checks (memory, other LAN proxy apps, TPROXY support)  2 test every server
+#   3 decide: several working VLESS/VMess/Trojan servers -> "auto" (Xray balancer, always
+#     the fastest working one), else the fastest single server; engine TPROXY (TCP+UDP)
+#     when possible  4 --apply: switch the whole LAN to it and verify
+cmd_best() {
+    load_conf
+    apply=0 inst=0 single=0
+    for o in "$@"; do case $o in --apply) apply=1 ;; --install) inst=1 ;; --single) single=1 ;; esac; done
+    mkdir -p "$RUN"; : >"$RUN/best.running"
+    say "== 1/4 router checks"
+    mem=$(awk '/MemAvailable/ { print int($2 / 1024) }' /proc/meminfo 2>/dev/null)
+    say "memory      : ${mem:-?} MB available$([ "${mem:-999}" -lt 80 ] && echo '  (low: stop other programs for reliable tests)')"
+    c=$(conflicts); say "other proxy : ${c:-none}"
+    [ -n "$c" ] && warn "these also redirect the LAN and can break the tunnel - turn them off"
+    if tproxy_ok; then say "TPROXY      : supported (TCP + UDP)"
+    elif [ $inst = 1 ]; then engine_install
+    else say "TPROXY      : not available (xec engine install  to try adding it)"; fi
+    say "== 2/4 testing every server"
+    : >"$RUN/best.tsv"
+    for n in $(prof_list); do
+        t=$(sed -n "s/^P_TYPE='\(.*\)'/\1/p" "$PROF/$n.conf")
+        r=$(probe "$n" 2>/dev/null | tail -n 1)
+        case $r in
+            OK*) ms=$(printf '%s' "$r" | sed -n 's/^OK \([0-9]*\)ms.*/\1/p'); printf '%s\t%s\tOK\t%s\n' "$n" "$t" "${ms:-0}" >>"$RUN/best.tsv"
+                printf '  OK   %-18s %-7s %6s ms\n' "$n" "$t" "${ms:-0}" ;;
+            *) printf '%s\t%s\tFAIL\t0\n' "$n" "$t" >>"$RUN/best.tsv"
+                printf '  FAIL %-18s %-7s %s\n' "$n" "$t" "$(printf '%s' "${r#FAIL }" | cut -c1-60)" ;;
+        esac
+    done
+    say "== 3/4 decision"
+    okn=$(awk -F'\t' '$3 == "OK"' "$RUN/best.tsv" | wc -l)
+    if [ "$okn" -eq 0 ]; then
+        err "no server works from this network - nothing changed (xec diag shows where it stops)"
+        rm -f "$RUN/best.running"; return 1
+    fi
+    # busybox sort: put the time first and sort numerically on it
+    fastest=$(awk -F'\t' '$3 == "OK" { print $4 " " $1 }' "$RUN/best.tsv" | sort -n | head -n 1 | cut -d' ' -f2)
+    # fastest first: before its first measurement the balancer falls back to the first one
+    pool=$(awk -F'\t' '$3 == "OK" && $2 != "ssh" { print $4 " " $1 }' "$RUN/best.tsv" | sort -n | cut -d' ' -f2 | tr '\n' ' ' | sed 's/ $//')
+    pn=$(printf '%s' "$pool" | wc -w)
+    if [ $single = 0 ] && [ "$pn" -ge 2 ]; then
+        choice=auto
+        say "choice      : auto - Xray balancer over $pn working servers ($pool), always the fastest one (now: $fastest)"
+    else
+        choice=$fastest
+        say "choice      : $fastest (fastest working server)"
+    fi
+    ACTIVE=$choice; ENG_CACHE=''
+    say "engine      : $(eff_engine)$([ "$(eff_engine)" = tproxy ] && echo ' (TCP + UDP)' || echo ' (TCP + DNS)')"
+    if [ $apply = 0 ]; then say "apply it    : xec best --apply"; rm -f "$RUN/best.running"; return 0; fi
+    say "== 4/4 applying to the whole LAN"
+    conf_set "$CONF" AUTO_POOL "$pool"
+    conf_set "$CONF" ACTIVE "$choice"
+    conf_set "$CONF" ROUTE all
+    log "best: $choice (pool: ${pool:-none})"
+    cmd_start
+    rm -f "$RUN/best.running"
+    return 0
+}
+
 # everything needed to see why the tunnel does not work (no secrets)
 # ------------------------------------------------------------- SNI hosts
 # $ETC/sni-hosts.txt   one host per line (the list to scan)
@@ -830,6 +1021,9 @@ cmd_diag() {
     if is_running; then t="RUNNING"; else t="STOPPED"; fi
     say "tunnel : $t | active=$ACTIVE | route=$ROUTE dns_tunnel=$DNS_TUNNEL killswitch=$KILLSWITCH failover=$FAILOVER$([ -f "$RUN/fw-suspended" ] && echo ' (suspended)')"
     say "LAN    : if=$LAN_IF ip=$LAN_IP | web port $WEB_PORT (password: $([ "$WEB_AUTH" = 1 ] && echo on || echo off))"
+    say "engine : setting $ENGINE | TPROXY supported: $(tproxy_ok && echo yes || echo no) | in use: $(eff_engine)"
+    c=$(conflicts); say "others : ${c:-no other LAN proxy apps}"
+    [ "$ACTIVE" = auto ] && say "auto   : balancer over $(auto_pool | tr '\n' ' ')(probe every $OBS_INTERVAL)"
     if [ -n "$ACTIVE" ] && prof_exists "$ACTIVE"; then
         load_prof "$ACTIVE"
         if [ "$P_TYPE" = ssh ]; then
@@ -890,7 +1084,7 @@ cmd_watchdog() {
     f=$(($(cat "$RUN/fails" 2>/dev/null || echo 0) + 1)); echo "$f" >"$RUN/fails"
     log "watchdog: $ACTIVE check failed ($f)"
     [ "$f" -ge 2 ] || return 0
-    if [ "$FAILOVER" = 1 ]; then
+    if [ "$FAILOVER" = 1 ] && [ "$ACTIVE" != auto ]; then
         for n in $(prof_list); do
             [ "$n" = "$ACTIVE" ] && continue
             if probe "$n" >/dev/null 2>&1; then
@@ -909,11 +1103,15 @@ cmd_watchdog() {
 
 # ------------------------------------------------------------------ stats
 stat_val() { printf '%s' "$1" | jsonfilter -e "@.stat[@.name='outbound>>>proxy>>>traffic>>>$2'].value" 2>/dev/null || echo 0; }
-cmd_stats() { # -> "UP DOWN" bytes
+cmd_stats() { # -> "UP DOWN" bytes (the tunnel outbound, or all servers of "auto")
     load_conf
-    s=$("$XRAY" api statsquery --server="127.0.0.1:$API_PORT" -pattern 'outbound>>>proxy' 2>/dev/null)
-    u=$(stat_val "$s" uplink); d=$(stat_val "$s" downlink)
-    printf '%s %s\n' "${u:-0}" "${d:-0}"
+    "$XRAY" api statsquery --server="127.0.0.1:$API_PORT" -pattern 'outbound>>>' 2>/dev/null | tr -d ' \n' |
+        grep -o '{[^{}]*}' | awk '{
+            n = $0; sub(/.*"name":"/, "", n); sub(/".*/, "", n)
+            v = $0; if (v ~ /"value":/) { sub(/.*"value":"?/, "", v); sub(/[^0-9].*/, "", v) } else v = 0
+            if (n ~ /^outbound>>>(proxy|p_[^>]*)>>>traffic>>>uplink$/) u += v
+            if (n ~ /^outbound>>>(proxy|p_[^>]*)>>>traffic>>>downlink$/) d += v
+        } END { printf "%d %d\n", u, d }'
 }
 human() { awk -v b="$1" 'BEGIN{ split("B KB MB GB TB",u," "); i=1; while (b>=1024 && i<5) { b/=1024; i++ } printf (i==1?"%d %s":"%.1f %s"), b, u[i] }'; }
 
@@ -1054,7 +1252,8 @@ cmd_list() {
     done
 }
 cmd_use() {
-    prof_exists "${1:-}" || die "profile not found: ${1:-}"
+    if [ "${1:-}" = auto ]; then [ -n "$(auto_pool)" ] || die "auto needs at least one VLESS/VMess/Trojan server"
+    else prof_exists "${1:-}" || die "profile not found: ${1:-}"; fi
     conf_set "$CONF" ACTIVE "$1"; ok "active profile: $1"
     is_running && cmd_start
     return 0
@@ -1092,10 +1291,13 @@ cmd_forget() { # NAME - forget the stored SSH host key
 }
 
 # --------------------------------------------------------------- settings
-SKEYS='ROUTE DNS_TUNNEL DNS_SERVER BLOCK_QUIC BLOCK_V6 KILLSWITCH FAILOVER SNIFF BYPASS_SRC BYPASS_DST LAN_IF LAN_IP SOCKS_PORT HTTP_PORT REDIR_PORT DNS_PORT API_PORT SSH_SOCKS WEB WEB_PORT WEB_AUTH LOGLEVEL CHECK_URL TRACE_URL'
+SKEYS='ENGINE OBS_INTERVAL AUTO_POOL ROUTE DNS_TUNNEL DNS_SERVER BLOCK_QUIC BLOCK_V6 KILLSWITCH FAILOVER SNIFF BYPASS_SRC BYPASS_DST LAN_IF LAN_IP SOCKS_PORT HTTP_PORT REDIR_PORT DNS_PORT API_PORT SSH_SOCKS TPROXY_PORT WEB WEB_PORT WEB_AUTH LOGLEVEL CHECK_URL TRACE_URL'
 valid_setting() { # KEY VALUE
     case $1 in
         ROUTE) match 'all|proxy' "$2" ;;
+        ENGINE) match 'auto|redirect|tproxy' "$2" ;;
+        OBS_INTERVAL) match '[0-9]{1,4}[sm]' "$2" ;;
+        AUTO_POOL) [ -z "$2" ] || match "$RE_NAME( $RE_NAME)*" "$2" ;;
         DNS_TUNNEL | BLOCK_QUIC | BLOCK_V6 | KILLSWITCH | FAILOVER | WEB | WEB_AUTH | SNIFF) match '0|1' "$2" ;;
         DNS_SERVER) match "$RE_IP4" "$2" ;;
         LAN_IP) [ -z "$2" ] || match "$RE_IP4" "$2" ;;
@@ -1227,7 +1429,7 @@ cgi_status() {
     st=''
     for k in $SKEYS; do eval "v=\$$k"; st="$st${st:+,}\"$k\":$(js "$v")"; done
     pub=''; [ -f "$ETC/id_ed25519.pub" ] && pub=$(cat "$ETC/id_ed25519.pub")
-    reply "{\"ok\":true,\"auth\":$([ "$WEB_AUTH" = 1 ] && echo true || echo false),\"version\":\"$XEC_VERSION\",\"xray\":$(js "$xv"),\"running\":$run,\"active\":$(js "$ACTIVE"),\"suspended\":$([ -f "$RUN/fw-suspended" ] && echo true || echo false),\"lan_ip\":$(js "$LAN_IP"),\"lan_if\":$(js "$LAN_IF"),\"up\":$up,\"down\":$down,\"uptime\":$(js "$(uptime | sed 's/.*up *//;s/, *load.*//')"),\"sshkey\":$(js "$pub"),\"profiles\":[$ps],\"settings\":{$st}}"
+    reply "{\"ok\":true,\"auth\":$([ "$WEB_AUTH" = 1 ] && echo true || echo false),\"version\":\"$XEC_VERSION\",\"xray\":$(js "$xv"),\"running\":$run,\"active\":$(js "$ACTIVE"),\"suspended\":$([ -f "$RUN/fw-suspended" ] && echo true || echo false),\"lan_ip\":$(js "$LAN_IP"),\"engine\":$(js "$(eff_engine)"),\"lan_if\":$(js "$LAN_IF"),\"up\":$up,\"down\":$down,\"uptime\":$(js "$(uptime | sed 's/.*up *//;s/, *load.*//')"),\"sshkey\":$(js "$pub"),\"profiles\":[$ps],\"settings\":{$st}}"
 }
 cgi_exitinfo() {
     load_conf
@@ -1294,7 +1496,7 @@ cmd_cgi() {
     [ "$WEB_AUTH" != 1 ] || cgi_session || { printf 'Status: 401 Unauthorized\r\nContent-Type: application/json\r\n\r\n{"ok":false,"auth":false}\n'; exit 0; }
     if [ "${REQUEST_METHOD:-}" = POST ]; then
         [ "$(fv csrf)" = "$CSRF" ] || reply_err "bad CSRF token - reload the page"
-    elif [ "$a" != status ] && [ "$a" != logs ] && [ "$a" != diag ] && [ "$a" != snistatus ] && [ "$a" != csrf ] && [ "$a" != export ]; then
+    elif [ "$a" != status ] && [ "$a" != logs ] && [ "$a" != diag ] && [ "$a" != snistatus ] && [ "$a" != bestlog ] && [ "$a" != csrf ] && [ "$a" != export ]; then
         reply_err "POST only"
     fi
     case $a in
@@ -1307,6 +1509,15 @@ cmd_cgi() {
             printf 'Status: 200 OK\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename="xe-client-backup.txt"\r\nCache-Control: no-store\r\n\r\n'
             cmd_export; exit 0 ;;
         exitinfo) cgi_exitinfo ;;
+        best)
+            [ -f "$RUN/best.running" ] && [ -z "$(find "$RUN/best.running" -mmin +20 2>/dev/null)" ] && reply_err "already running"
+            o='--apply'; [ "$(fv install)" = 1 ] && o="$o --install"; [ "$(fv single)" = 1 ] && o="$o --single"
+            : >"$RUN/best.running"
+            ( "$SELF" best $o ) </dev/null >"$LOGD/best.log" 2>&1 &
+            reply '{"ok":true,"msg":"started"}' ;;
+        bestlog)
+            t=$(sed 's/\x1b\[[0-9;]*m//g' "$LOGD/best.log" 2>/dev/null | tail -n 80 | jtext)
+            reply "{\"ok\":true,\"running\":$([ -f "$RUN/best.running" ] && echo true || echo false),\"msg\":${t:-\"\"}}" ;;
         snistatus)
             # a scan that died leaves its progress file: forget it after 30 minutes
             [ -n "$(find "$RUN/sni.progress" -mmin +30 2>/dev/null)" ] && rm -f "$RUN/sni.progress"
@@ -1518,6 +1729,12 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
    <div class="kv"><small>محطة Cloudflare</small><span id="e-colo">-</span></div><div class="kv"><small>زمن الاستجابة</small><span id="e-ms">-</span></div>
   </div>
  </div>
+ <div class="card"><h3>الأفضل تلقائياً</h3>
+  <p class="mut">يفحص الراوتر وكل السيرفرات، ثم يختار الأنسب ويوجّه كل الشبكة عبره. مع أكثر من سيرفر شغال يستخدم وضع <b>auto</b>: موازن Xray يقيس السيرفرات باستمرار ويستخدم الأسرع دائماً. ومحرك <b>TPROXY</b> (TCP وUDP معاً) إن كان الراوتر يدعمه.</p>
+  <label class="tog" style="border:0"><span>تثبيت دعم TPROXY إن لم يكن موجوداً (يحتاج إنترنت)</span><input type="checkbox" id="b-inst"></label>
+  <label class="tog" style="border:0"><span>سيرفر واحد فقط (بدون موازن)</span><input type="checkbox" id="b-single"></label>
+  <button class="btn" id="b-go">افحص واختر الأفضل وشغّله</button>
+  <pre id="b-out" class="hide"></pre></div>
  <div class="card"><h3>للأجهزة</h3><p class="mut" id="s-px"></p></div>
 </section>
 <section id="t-pr" class="hide"><div class="card"><h3>الخوادم المحفوظة</h3>
@@ -1565,6 +1782,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
  <div class="tog"><div>التبديل التلقائي<small>ينتقل لخادم آخر يعمل عند الانقطاع</small></div><input type="checkbox" id="c-FAILOVER"></div>
  <div class="tog"><div>طلب كلمة مرور لفتح اللوحة<small>عند التفعيل تظهر كلمة المرور مرة واحدة</small></div><input type="checkbox" id="c-WEB_AUTH"></div>
  <div class="tog"><div>Sniffing (اسم الموقع)<small>يرسل اسم الموقع للخادم بدل IP</small></div><input type="checkbox" id="c-SNIFF"></div>
+ <div class="row"><div><label>محرك التوجيه</label><select id="v-ENGINE"><option value="auto">تلقائي (TPROXY إن توفر)</option><option value="tproxy">TPROXY: TCP + UDP</option><option value="redirect">REDIRECT: TCP + DNS</option></select></div><div><label>فترة قياس السيرفرات (auto)</label><input id="v-OBS_INTERVAL" placeholder="60s"></div></div>
  <div class="row"><div><label>خادم DNS</label><input id="v-DNS_SERVER"></div><div><label>مستوى السجل</label><select id="v-LOGLEVEL"><option>none</option><option>error</option><option>warning</option><option>info</option><option>debug</option></select></div></div>
  <label>أجهزة خارج النفق (IP مفصولة بمسافة)</label><input id="v-BYPASS_SRC" placeholder="192.168.8.50 192.168.8.51">
  <label>وجهات مباشرة (IP/CIDR أو domain:example.sa)</label><input id="v-BYPASS_DST" placeholder="domain:gov.sa 1.2.3.0/24">
@@ -1629,6 +1847,10 @@ $("lp").onkeydown=function(e){if(e.key=="Enter")$("lb").onclick()};
 $("lo").onclick=function(){api("logout",{}).then(function(){location.reload()})};
 function loadDiag(){$("lg-r").disabled=true;api("diag").then(function(j){$("lg-r").disabled=false;$("lg-out").textContent=j.msg||"-"}).catch(function(){$("lg-r").disabled=false})}
 $("lg-r").onclick=loadDiag;
+var bT=null;
+function bestPoll(){api("bestlog").then(function(j){$("b-out").classList.remove("hide");$("b-out").textContent=j.msg||"…";if(j.running){bT=setTimeout(bestPoll,3000);$("b-go").disabled=true}else{$("b-go").disabled=false;load()}})}
+$("b-go").onclick=function(){if(!confirm("سيُفحص كل شيء ثم يُطبّق الأفضل على كل الشبكة. متابعة؟"))return;
+  api("best",{install:$("b-inst").checked?"1":"0",single:$("b-single").checked?"1":"0"}).then(function(j){if(!j.ok)return toast(j.msg,true);$("b-go").disabled=true;setTimeout(bestPoll,1500)})};
 var snT=null;
 function loadSni(){var ps=$("sn-prof"),cur=ps.value;if(S){ps.innerHTML=S.profiles.map(function(p){return'<option value="'+esc(p.name)+'">'+esc(p.name)+' ('+esc(p.type)+')</option>'}).join("");ps.value=cur||S.active}
   api("snistatus").then(function(j){$("sn-count").textContent=j.count;$("sn-list").textContent=j.hosts;
@@ -1658,9 +1880,10 @@ function load(){api("status").then(function(j){S=j;$("lo").classList.toggle("hid
   $("hb").className="badge "+(j.running?(j.suspended?"y":"g"):"r");$("hb").textContent=j.running?(j.suspended?"النفق متوقف مؤقتاً":"متصل"):"متوقف";
   $("s-run").innerHTML=j.running?'<span class="badge g">يعمل</span>':'<span class="badge r">متوقف</span>';
   $("s-act").textContent=j.active||"-";$("s-up").textContent=hb(j.up);$("s-dn").textContent=hb(j.down);$("s-xv").textContent=j.xray||"-";
-  $("s-rt").textContent=j.settings.ROUTE=="all"?"كل الأجهزة ("+j.lan_if+")":"وكيل فقط";
+  $("s-rt").textContent=(j.settings.ROUTE=="all"?"كل الأجهزة ("+j.lan_if+")":"وكيل فقط")+" · "+(j.engine=="tproxy"?"TPROXY: TCP+UDP":"REDIRECT: TCP+DNS");
   $("s-px").innerHTML='SOCKS5: <code>'+esc(j.lan_ip)+':'+esc(j.settings.SOCKS_PORT)+'</code> — HTTP: <code>'+esc(j.lan_ip)+':'+esc(j.settings.HTTP_PORT)+'</code><br>عند تفعيل "توجيه كل الأجهزة" لا تحتاج الأجهزة لأي إعداد.';
   var h="";j.profiles.forEach(function(p){h+="<tr><td>"+(p.name==j.active?'<span class="badge b">●</span> ':"")+esc(p.name)+(p.remark?'<br><small class="mut">'+esc(p.remark)+"</small>":"")+"</td><td>"+kind(p)+"</td><td><span class=addr>"+esc(p.addr)+":"+esc(p.port)+"</span>"+(p.sni?'<br><small class="mut">SNI: '+esc(p.sni)+"</small>":"")+'</td><td><button class="btn" data-u="'+esc(p.name)+'">استخدام</button><button class="btn sec" data-p="'+esc(p.name)+'">اختبار</button>'+'<button class="btn sec" data-e="'+esc(p.name)+'">تعديل</button>'+'<button class="btn dng" data-d="'+esc(p.name)+'">حذف</button></td></tr>'});
+  if(j.profiles.some(function(p){return p.type!="ssh"}))h='<tr><td>'+(j.active=="auto"?'<span class="badge b">●</span> ':"")+'auto<br><small class="mut">الأفضل تلقائياً (موازن)</small></td><td><span class="chip">balancer</span><span class="chip">leastPing</span></td><td class="mut">كل سيرفرات VLESS / VMess / Trojan</td><td><button class="btn" data-u="auto">استخدام</button></td></tr>'+h;
   $("pl").innerHTML=h||'<tr><td colspan=4 class="mut">لا توجد خوادم بعد — من "إضافة"</td></tr>';
   $("pl").querySelectorAll("[data-u]").forEach(function(b){b.onclick=function(){act("use",{name:b.dataset.u},b)}});
   $("pl").querySelectorAll("[data-p]").forEach(function(b){b.onclick=function(){act("probe",{name:b.dataset.p},b)}});
@@ -1694,7 +1917,7 @@ $("h-trans").onchange=sshFields;$("h-auth").onchange=sshFields;sshFields();
 function editSsh(n){var p=S.profiles.filter(function(x){return x.name==n})[0];if(!p)return;$("h-name").value=p.name;$("h-remark").value=p.remark;$("h-host").value=p.addr;$("h-port").value=p.port;$("h-user").value=p.user;$("h-auth").value=p.auth||"pass";$("h-trans").value=p.trans||"direct";$("h-sni").value=p.sni;$("h-wshost").value=p.wshost;$("h-wspath").value=p.wspath;$("h-payload").value=p.payload;$("h-pass").value="";sshFields();document.querySelector('#nav [data-t="ad"]').click()}
 $("h-go").onclick=function(){var d={name:$("h-name").value.trim(),remark:$("h-remark").value.trim(),host:$("h-host").value.trim(),port:$("h-port").value.trim(),user:$("h-user").value.trim(),auth:$("h-auth").value,pass:$("h-pass").value,trans:$("h-trans").value,sni:$("h-sni").value.trim(),wshost:$("h-wshost").value.trim(),wspath:$("h-wspath").value.trim(),payload:$("h-payload").value.replace(/\r?\n/g,"[crlf]")};
   act("addssh",d,this).then(function(j){if(j&&j.ok){$("h-pass").value="";if(d.auth=="key")api("sshkey",{}).then(function(k){$("h-keyv").textContent=k.msg;$("h-key").classList.remove("hide")})}})};
-var TOG=["DNS_TUNNEL","BLOCK_QUIC","BLOCK_V6","KILLSWITCH","FAILOVER","SNIFF","WEB_AUTH"],VAL=["DNS_SERVER","LOGLEVEL","BYPASS_SRC","BYPASS_DST","CHECK_URL"];
+var TOG=["DNS_TUNNEL","BLOCK_QUIC","BLOCK_V6","KILLSWITCH","FAILOVER","SNIFF","WEB_AUTH"],VAL=["ENGINE","OBS_INTERVAL","DNS_SERVER","LOGLEVEL","BYPASS_SRC","BYPASS_DST","CHECK_URL"];
 function fillSettings(){if(!S)return;var s=S.settings;$("c-ROUTE").checked=s.ROUTE=="all";TOG.forEach(function(k){$("c-"+k).checked=s[k]=="1"});VAL.forEach(function(k){$("v-"+k).value=s[k]})}
 $("se-go").onclick=function(){var s=S.settings,ch=[],b=this;var r=$("c-ROUTE").checked?"all":"proxy";if(r!=s.ROUTE)ch.push(["ROUTE",r]);
   TOG.forEach(function(k){var v=$("c-"+k).checked?"1":"0";if(v!=s[k])ch.push([k,v])});VAL.forEach(function(k){var v=$("v-"+k).value.trim();if(v!=s[k])ch.push([k,v])});
@@ -1990,6 +2213,7 @@ cmd_menu() {
         say " 9) web panel password on/off  10) update Xray"
         say "11) show logs                  12) SSH public key"
         say "15) SNI host scanner (bug hosts)"
+        say "16) BEST: test everything, pick the best, route the whole LAN"
         say "99) uninstall - remove the script completely"
         say " 0) exit"
         ask "choice: " || return 0
@@ -2021,6 +2245,8 @@ cmd_menu() {
             11) tail -n 30 "$LOGF" 2>/dev/null; tail -n 15 "$LOGD/xray.log" 2>/dev/null ;;
             12) (ssh_key) ;;
             15) menu_sni ;;
+            16) o='--apply'; ask "also install TPROXY support (TCP+UDP) if missing? y/N: " || return 0
+                [ "$REPLY" = y ] && o="$o --install"; (cmd_best $o) ;;
             99) say "This removes the script, Xray, the web panel and the tunnel rules."
                 ask "also delete saved servers and settings? y/N: " || return 0; o=''; [ "$REPLY" = y ] && o=--purge
                 ask "also remove the packages it installed (openssh-client, sshpass ...)? y/N: " || return 0; [ "$REPLY" = y ] && o="$o --packages"
@@ -2041,6 +2267,9 @@ XE3000 CLIENT $XEC_VERSION - router -> your server (VLESS REALITY / SSH)
                                 [--xray-version vX.Y.Z | --xray-zip F --xray-dgst F]
   menu1  (or: xec menu)      interactive menu
   xec status | start | stop | restart | test [NAME] | ping | diag
+  xec best [--apply] [--install] [--single]   test everything, pick the best, route the whole LAN
+  xec use auto                              Xray balancer: always the fastest working server
+  xec engine [auto|redirect|tproxy|install|check]   redirect = TCP+DNS, tproxy = TCP+UDP
   xec sni add HOST.. | import FILE|URL | list | clear | results
   xec sni scan [direct|sni|tunnel] [PROFILE] [sni|addr|both] [--ok]   SNI / bug-host scanner
                              (--ok: only the hosts that worked in the last scan)
@@ -2084,6 +2313,8 @@ case $cmd in
     ping) cmd_ping ;;
     diag) cmd_diag ;;
     sni) cmd_sni "$@" ;;
+    best) cmd_best "$@" ;;
+    engine) cmd_engine "$@" ;;
     set) cmd_set "$@" ;;
     route) cmd_route "$@" ;;
     bypass) cmd_bypass "$@" ;;

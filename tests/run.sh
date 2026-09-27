@@ -197,6 +197,7 @@ net_up() {
     : >"$W/http.log"
     I python3 "$HERE/helpers.py" http 203.0.113.10 80 "$W/http.log" >"$W/h-http.out" 2>&1 &
     I python3 "$HERE/helpers.py" dns 203.0.113.53 "$W/dns.log" >"$W/h-dns.out" 2>&1 &
+    : >"$W/udp.log"; I python3 "$HERE/helpers.py" udp 203.0.113.10 7000 "$W/udp.log" >"$W/h-udp.out" 2>&1 &
     I python3 "$HERE/helpers.py" tls 203.0.113.10:443 203.0.113.10:80 "$W/bug.crt" "$W/bug.key" "$W/tls-inet.log" >"$W/h-tls3.out" 2>&1 &
     X sh -c 'grep -q good1.example /etc/hosts || echo "203.0.113.10 good1.example" >>/etc/hosts'
     # a "bug host" name that points at the server (address trick: address = bug host, SNI/Host = server)
@@ -531,6 +532,44 @@ mrow swss          ssh    websocket   tls      bug.example.com          OK
 mrow skey          ssh    direct+key  -        "(no SNI)"               OK
 echo
 t "protocol matrix: $MX rows as expected, $MXF wrong" test "$MXF" = 0
+
+step "best setup: TPROXY (TCP + UDP), auto balancer, xec best"
+udp_peer() { : >"$W/udp.log"; echo "ping$1" | C socat -T3 - UDP:203.0.113.10:7000 >/dev/null 2>&1; sleep 1; cut -d' ' -f1 "$W/udp.log" | tail -n 1; }
+X xec use A >/dev/null
+X xec engine check | sed 's/^/    | /'
+X xec engine install | sed 's/^/    | /'
+if X sh -c 'xec engine check | grep -q "TPROXY supported: yes"'; then pass "TPROXY support installed with opkg"; else fail "TPROXY support installed with opkg"; fi
+X xec start | sed 's/^/    | /'
+X iptables -t mangle -S XEC_TP | sed 's/^/    | /'
+t "engine in use: tproxy" X sh -c 'xec diag | grep -q "in use: tproxy"'
+out=$(lan_get /hello 10)
+t "TPROXY: LAN TCP through the tunnel" sh -c "[ '$out' = HELLO-XE3000 ] && [ '$(lastpeer)' != 192.168.8.100 ]"
+p=$(udp_peer 1); echo "    | UDP peer seen by the internet server: $p"
+t "TPROXY: LAN UDP through the tunnel too (games, calls, QUIC)" sh -c "[ -n '$p' ] && [ '$p' != 192.168.8.100 ]"
+C busybox nslookup tp.example 192.168.8.1 >"$W/nsl3.out" 2>&1
+t "TPROXY: DNS still through the tunnel" grep -q 203.0.113.99 "$W/nsl3.out"
+X xec set OBS_INTERVAL 5s >/dev/null
+X xec use auto | sed 's/^/    | /'
+sleep 8
+okc=0; for i in 1 2 3 4 5 6; do [ "$(lan_get /hello 10)" = HELLO-XE3000 ] && [ "$(lastpeer)" != 192.168.8.100 ] && okc=$((okc + 1)); done
+echo "    | auto (all $(X sh -c 'xec diag | grep "^auto" | wc -w') pool entries incl. broken ones): $okc/6 requests through the tunnel"
+t "auto balancer: broken servers in the pool are avoided (6/6 requests work)" test "$okc" = 6
+st=$(X xec stats); echo "    | $st"
+t "auto: traffic counters add up over all servers" sh -c "echo '$st' | grep -qv 'down 0 B'"
+X sh -c 'printf "#!/bin/sh /etc/rc.common\nSTART=90\nstart() { :; }\n" >/etc/init.d/passwall; chmod 755 /etc/init.d/passwall; /etc/init.d/passwall enable'
+t "conflict detection: Passwall found" X sh -c 'xec diag | grep -q "passwall (enabled)"'
+X sh -c '/etc/init.d/passwall disable; rm -f /etc/init.d/passwall'
+X xec best --apply >"$W/best.out" 2>&1; sed 's/^/    | /' "$W/best.out"
+t "xec best: tests every server and picks auto over the working ones" sh -c "grep -q '^choice      : auto' '$W/best.out' && grep -q 'FAIL tjbad' '$W/best.out'"
+t "xec best: engine TPROXY, applied and verified" sh -c "grep -q '^engine      : tproxy' '$W/best.out' && grep -q 'internet through the server works' '$W/best.out'"
+t "xec best: broken servers left out of the pool" X sh -c "grep -q \"^AUTO_POOL=\" /etc/xe-client/client.conf && ! grep '^AUTO_POOL=' /etc/xe-client/client.conf | grep -q tjbad"
+out=$(lan_get /hello 10); p=$(udp_peer 2)
+t "after xec best: LAN TCP + UDP through the tunnel" sh -c "[ '$out' = HELLO-XE3000 ] && [ '$(lastpeer)' != 192.168.8.100 ] && [ -n '$p' ] && [ '$p' != 192.168.8.100 ]"
+CSB=$(C curl -s "http://192.168.8.1:8899/cgi-bin/api?a=csrf" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("csrf",""))' 2>/dev/null)
+if [ -z "$CSB" ]; then J3="$W/cookies3"; CSB=$(C curl -s -c "$J3" -d 'a=login&pass=Web-pass-123' http://192.168.8.1:8899/cgi-bin/api | python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf"])'); fi
+r=$(C curl -s -b "${J3:-/dev/null}" -d "a=best&single=1&csrf=$CSB" http://192.168.8.1:8899/cgi-bin/api); echo "    | $r"
+i=0; while [ $i -lt 90 ]; do C curl -s -b "${J3:-/dev/null}" "http://192.168.8.1:8899/cgi-bin/api?a=bestlog" >"$W/best.json"; grep -q '"running":false' "$W/best.json" && break; sleep 2; i=$((i + 1)); done
+t "web 'best' button: runs in the background and applies a single server" python3 -c "import json; j=json.load(open('$W/best.json')); assert '4/4' in j['msg'] and 'fastest working server' in j['msg'], j['msg'][-400:]"
 
 step "reboot"
 X xec use A >/dev/null

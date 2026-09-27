@@ -7,6 +7,7 @@
   helpers.py tls    LISTEN TARGET CERT KEY LOG
                                         TLS front (SSH-SSL / stunnel style): logs SNI,
                                         relays the decrypted stream to TARGET
+  helpers.py udp    IP PORT LOG         UDP echo (logs the peer address)
   helpers.py ws     LISTEN TARGET LOG   WebSocket upgrade relay (ws-epro style): answers
                                         101, logs the Host header, relays raw bytes
 """
@@ -182,6 +183,15 @@ def ws_main(listen, target, logf):
     serve(listen, h)
 
 
+def udp_main(ip, port, logf):
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.bind((ip, int(port)))
+    while True:
+        d, addr = u.recvfrom(4096)
+        log(logf, "%s %s" % (addr[0], d.decode(errors="replace").strip()))
+        u.sendto(b"ECHO:" + d, addr)
+
+
 if __name__ == "__main__":
     m, a = sys.argv[1], sys.argv[2:]
-    {"http": http_main, "dns": dns_main, "tls": tls_main, "ws": ws_main}[m](*a)
+    {"http": http_main, "dns": dns_main, "tls": tls_main, "ws": ws_main, "udp": udp_main}[m](*a)
