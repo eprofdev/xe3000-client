@@ -119,7 +119,17 @@ cat >"$W/server.json" <<EOF
 {"tag":"G","listen":"198.51.100.20","port":7443,"protocol":"trojan","settings":{"clients":[{"password":"Tr0jan-pass"}]},
  "streamSettings":{"network":"raw","security":"tls","tlsSettings":{"certificates":[{"certificateFile":"$W/www.crt","keyFile":"$W/www.key"}]}}},
 {"tag":"H","listen":"198.51.100.20","port":7444,"protocol":"trojan","settings":{"clients":[{"password":"Tr0jan-pass"}]},
- "streamSettings":{"network":"ws","wsSettings":{"path":"/tj"},"security":"tls","tlsSettings":{"certificates":[{"certificateFile":"$W/www.crt","keyFile":"$W/www.key"}]}}}],
+ "streamSettings":{"network":"ws","wsSettings":{"path":"/tj"},"security":"tls","tlsSettings":{"certificates":[{"certificateFile":"$W/www.crt","keyFile":"$W/www.key"}]}}},
+{"tag":"I","listen":"198.51.100.20","port":8443,"protocol":"vless","settings":{"clients":[{"id":"$UUID"}],"decryption":"none"},
+ "streamSettings":{"network":"ws","wsSettings":{"path":"/"},"security":"tls","tlsSettings":{"rejectUnknownSni":true,"certificates":[{"certificateFile":"$W/www.crt","keyFile":"$W/www.key"}]}}},
+{"tag":"J","listen":"198.51.100.20","port":8080,"protocol":"vless","settings":{"clients":[{"id":"$UUID"}],"decryption":"none"},"streamSettings":{"network":"ws","wsSettings":{"path":"/ws"},"security":"none"}},
+{"tag":"K","listen":"198.51.100.20","port":8444,"protocol":"vless","settings":{"clients":[{"id":"$UUID"}],"decryption":"none"},
+ "streamSettings":{"network":"grpc","grpcSettings":{"serviceName":"grpc1"},"security":"tls","tlsSettings":{"alpn":["h2"],"certificates":[{"certificateFile":"$W/www.crt","keyFile":"$W/www.key"}]}}},
+{"tag":"L","listen":"198.51.100.20","port":8081,"protocol":"vmess","settings":{"clients":[{"id":"$UUID"}]},"streamSettings":{"network":"httpupgrade","httpupgradeSettings":{"path":"/hu"},"security":"none"}},
+{"tag":"M","listen":"198.51.100.20","port":7445,"protocol":"trojan","settings":{"clients":[{"password":"Tr0jan-pass"}]},
+ "streamSettings":{"network":"grpc","grpcSettings":{"serviceName":"tjg"},"security":"tls","tlsSettings":{"alpn":["h2"],"certificates":[{"certificateFile":"$W/www.crt","keyFile":"$W/www.key"}]}}},
+{"tag":"N","listen":"198.51.100.20","port":8445,"protocol":"vless","settings":{"clients":[{"id":"$UUID"}],"decryption":"none"},
+ "streamSettings":{"network":"xhttp","xhttpSettings":{"path":"/xt"},"security":"tls","tlsSettings":{"alpn":["h2","http/1.1"],"certificates":[{"certificateFile":"$W/www.crt","keyFile":"$W/www.key"}]}}}],
 "outbounds":[{"protocol":"freedom","settings":{"finalRules":[{"action":"allow","ip":["203.0.113.0/24"]}]}}]}
 EOF
 t "server config valid" "$XRAY_HOST" run -test -c "$W/server.json"
@@ -189,6 +199,8 @@ net_up() {
     I python3 "$HERE/helpers.py" dns 203.0.113.53 "$W/dns.log" >"$W/h-dns.out" 2>&1 &
     I python3 "$HERE/helpers.py" tls 203.0.113.10:443 203.0.113.10:80 "$W/bug.crt" "$W/bug.key" "$W/tls-inet.log" >"$W/h-tls3.out" 2>&1 &
     X sh -c 'grep -q good1.example /etc/hosts || echo "203.0.113.10 good1.example" >>/etc/hosts'
+    # a "bug host" name that points at the server (address trick: address = bug host, SNI/Host = server)
+    X sh -c 'grep -q bug.example.net /etc/hosts || echo "198.51.100.20 bug.example.net" >>/etc/hosts'
     N openssl s_server -quiet -accept 127.0.0.1:19443 -cert "$W/www.crt" -key "$W/www.key" -cert_chain "$W/chain.crt" -www >/dev/null 2>&1 &
     N "$XRAY_HOST" run -c "$W/server.json" >"$W/xray-server.out" 2>&1 &
     N /usr/sbin/sshd -D -f "$W/sshd_config" -E "$W/sshd.log" &
@@ -470,6 +482,55 @@ X xec start >"$W/start-bad2.out" 2>&1; sed 's/^/    | /' "$W/start-bad2.out"
 out=$(lan_get /hello 6)
 t "kill switch on: LAN blocked and the message says how to undo it" sh -c "[ '$out' != HELLO-XE3000 ] && grep -q 'xec stop' '$W/start-bad2.out'"
 X xec set KILLSWITCH 0 >/dev/null
+
+step "protocol matrix: many fake servers, with and without SNI"
+# the WSS front was stopped by the kill-switch test - bring it back
+N python3 "$HERE/helpers.py" tls 198.51.100.30:8443 198.51.100.30:80 "$W/bug.crt" "$W/bug.key" "$W/tls2.log" >"$W/h-tls2b.out" 2>&1 &
+sleep 1
+P="--pcs $PCS"
+X xec add-proxy vlwstls --type vless --addr 198.51.100.20 --port 8443 --id "$UUID" --net ws --path '/?ed=2560' --sec tls --sni www.example.com --host www.example.com $P >/dev/null
+X xec add-proxy vlbug   --type vless --addr bug.example.net --port 8443 --id "$UUID" --net ws --path '/?ed=2560' --sec tls --sni www.example.com --host www.example.com $P >/dev/null
+X xec add-proxy vlwrong --type vless --addr 198.51.100.20 --port 8443 --id "$UUID" --net ws --path / --sec tls --sni wrong.example.org --host www.example.com $P >/dev/null
+X xec add-proxy vlwsno  --type vless --addr 198.51.100.20 --port 8080 --id "$UUID" --net ws --path /ws --sec none --host cdn.example.com >/dev/null
+X xec add-proxy vlgrpc  --type vless --addr 198.51.100.20 --port 8444 --id "$UUID" --net grpc --svc grpc1 --sec tls --sni www.example.com $P >/dev/null
+X xec add-proxy vlxhttp --type vless --addr 198.51.100.20 --port 8445 --id "$UUID" --net xhttp --path /xt --sec tls --sni www.example.com --host www.example.com --alpn h2 $P >/dev/null
+X xec add-proxy vmhu    --type vmess --addr 198.51.100.20 --port 8081 --id "$UUID" --net httpupgrade --path /hu --sec none --host cdn.example.com >/dev/null
+X xec add-proxy tjgrpc  --type trojan --addr 198.51.100.20 --port 7445 --pass Tr0jan-pass --net grpc --svc tjg --sec tls --sni www.example.com $P >/dev/null
+X xec add-proxy rlwrong --type vless --addr 198.51.100.20 --port 443 --id "$UUID" --net tcp --flow xtls-rprx-vision --sec reality --sni wrong.example.org --pbk "$PBK" --sid a1b2c3d4 >/dev/null
+printf '\n    %-15s %-9s %-12s %-10s %-26s %-7s %s\n' PROFILE PROTOCOL TRANSPORT SECURITY SNI EXPECT RESULT
+printf '    %s\n' "-----------------------------------------------------------------------------------------------------"
+MX=0 MXF=0
+mrow() { # NAME PROTO TRANSPORT SECURITY SNI EXPECT
+    r=$(X xec test "$1" 2>&1 | tail -n 1)
+    case $r in *" OK "*) got=OK ;; *) got=FAIL ;; esac
+    ms=$(printf '%s' "$r" | sed -n 's/.* OK \([0-9]*ms\).*/\1/p')
+    if [ "$got" = "$6" ]; then mark=PASS; MX=$((MX + 1)); else mark=WRONG; MXF=$((MXF + 1)); fi
+    printf '    %-15s %-9s %-12s %-10s %-26s %-7s %-4s %-6s %s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$got" "$ms" "$mark"
+}
+mrow A             vless  raw+vision  reality  www.example.com          OK
+mrow B             vless  raw+vision  reality+pq www.example.com        OK
+mrow XHTTP_REALITY vless  xhttp       reality  www.example.com          OK
+mrow rlwrong       vless  raw+vision  reality  "wrong.example.org"      FAIL
+mrow C             vless  raw+vision  mlkem768 "(no SNI)"               OK
+mrow vlwstls       vless  ws          tls      "www.example.com +Host"  OK
+mrow vlbug         vless  ws          tls      "addr=bug host, SNI=srv" OK
+mrow vlwrong       vless  ws          tls      "wrong.example.org"      FAIL
+mrow vlwsno        vless  ws          none     "(no SNI) +Host"         OK
+mrow vlgrpc        vless  grpc        tls      www.example.com          OK
+mrow vlxhttp       vless  xhttp       tls      www.example.com          OK
+mrow vmws          vmess  ws          tls      www.example.com          OK
+mrow "$VMTCP"      vmess  raw         none     "(no SNI)"               OK
+mrow vmhu          vmess  httpupgrade none     "(no SNI) +Host"         OK
+mrow tj            trojan raw         tls      www.example.com          OK
+mrow tjws          trojan ws          tls      www.example.com          OK
+mrow tjgrpc        trojan grpc        tls      www.example.com          OK
+mrow sdirect       ssh    direct      -        "(no SNI)"               OK
+mrow stls          ssh    tls         tls      bug.example.com          OK
+mrow sws           ssh    websocket   none     "(no SNI) Host=bug"      OK
+mrow swss          ssh    websocket   tls      bug.example.com          OK
+mrow skey          ssh    direct+key  -        "(no SNI)"               OK
+echo
+t "protocol matrix: $MX rows as expected, $MXF wrong" test "$MXF" = 0
 
 step "reboot"
 X xec use A >/dev/null
