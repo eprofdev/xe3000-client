@@ -288,6 +288,8 @@ X xec sni scan sni tj >"$W/sni-s.out" 2>&1; sed 's/^/    | /' "$W/sni-s.out"
 t "scan 'SNI to my server' (TLS handshake with each SNI)" grep -q '^OK   www.example.com' "$W/sni-s.out"
 X xec sni scan direct >"$W/sni-d.out" 2>&1; sed 's/^/    | /' "$W/sni-d.out"
 t "scan direct: reachable host OK, unknown host FAIL" sh -c "grep -q '^OK   good1.example' '$W/sni-d.out' && grep -q '^FAIL bad-sni.example.org' '$W/sni-d.out'"
+X xec sni scan tunnel A sni --ok >"$W/sni-ok.out" 2>&1; sed 's/^/    | /' "$W/sni-ok.out"
+t "--ok: re-checks only the hosts that worked in the last scan" sh -c "grep -q 'working: 0 of 1' '$W/sni-ok.out' && grep -q 'good1.example' '$W/sni-ok.out'"
 X xec sni use www.example.com badsni sni | sed 's/^/    | /'
 r=$(X xec test badsni); echo "    | $r"; case $r in *OK*) pass "sni use: a working host fixes the server that had a wrong SNI" ;; *) fail "sni use" ;; esac
 printf '15\n1\nfoo.example\n\n0\n0\n' | OW_EXTRA_ENV="NO_COLOR=1" ow_exec menu1 >"$W/menu15.out" 2>&1
@@ -339,6 +341,7 @@ t "tunnel running" X pgrep -f 'run -c /var/run/xe-client/xray.json'
 t "busy port 10085 detected and moved (API_PORT)" X sh -c "grep -q 'port 10085 (API_PORT) is already used' /tmp/xe-client/xec.log && grep -q \"^API_PORT='10086'\" /etc/xe-client/client.conf"
 X xec diag >"$W/diag.txt" 2>&1; sed -n '1,12p' "$W/diag.txt" | sed 's/^/    | /'
 t "xec diag: report with server, ports and config test" sh -c "grep -q 'Configuration OK' '$W/diag.txt' && grep -q '^server : vless tcp/reality' '$W/diag.txt'"
+t "xec diag: path check (TCP + TLS with the SNI)" sh -c "grep -q '^  TCP  198.51.100.20:443 .* ok' '$W/diag.txt' && grep -q '^  TLS  with SNI www.example.com ok' '$W/diag.txt'"
 t "xec diag: no UUID / password inside" sh -c "! grep -q '$UUID' '$W/diag.txt' && ! grep -q 'Pa55-w0rd' '$W/diag.txt' && ! grep -q 'Tr0jan-pass' '$W/diag.txt'"
 out=$(lan_get /hello)
 t "LAN client gets the page" test "$out" = "HELLO-XE3000"
@@ -435,6 +438,7 @@ C busybox nslookup viassh.example 192.168.8.1 >"$W/nsl2.out" 2>&1
 t "DNS over the SSH tunnel" grep -q 203.0.113.99 "$W/nsl2.out"
 
 step "kill switch + failover"
+X xec set KILLSWITCH 1 >/dev/null
 X xec set FAILOVER 0 >/dev/null
 kill "$(cat "$W/tls2.pid")" 2>/dev/null; pkill -f "helpers.py tls 198.51.100.30:8443" 2>/dev/null
 X sh -c 'kill $(pgrep -f "D 127.0.0.1:10811") 2>/dev/null'
@@ -454,6 +458,18 @@ t "failover switched to another working server" test -n "$act" -a "$act" != swss
 out=$(lan_get /hello 10)
 t "  ... LAN works through the new server" sh -c "[ '$out' = HELLO-XE3000 ] && [ '$(lastpeer)' != 192.168.8.100 ]"
 X tail -n 8 /tmp/xe-client/xec.log | sed 's/^/    | /'
+
+step "connecting to a server that passes no traffic"
+X xec set KILLSWITCH 0 >/dev/null
+X xec use tjbad >"$W/start-bad.out" 2>&1; sed 's/^/    | /' "$W/start-bad.out"
+t "start check says the server passes no traffic" grep -q 'does not pass traffic' "$W/start-bad.out"
+out=$(lan_get /hello 8)
+t "kill switch off (default): the LAN keeps the normal internet" sh -c "[ '$out' = HELLO-XE3000 ] && [ '$(lastpeer)' = 192.168.8.100 ]"
+X xec set KILLSWITCH 1 >/dev/null
+X xec start >"$W/start-bad2.out" 2>&1; sed 's/^/    | /' "$W/start-bad2.out"
+out=$(lan_get /hello 6)
+t "kill switch on: LAN blocked and the message says how to undo it" sh -c "[ '$out' != HELLO-XE3000 ] && grep -q 'xec stop' '$W/start-bad2.out'"
+X xec set KILLSWITCH 0 >/dev/null
 
 step "reboot"
 X xec use A >/dev/null

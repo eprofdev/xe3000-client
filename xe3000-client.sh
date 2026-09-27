@@ -121,7 +121,7 @@ b64dec() {
 # ---------------------------------------------------------------- config
 defaults() {
     ACTIVE='' ROUTE=all DNS_TUNNEL=1 DNS_SERVER=1.1.1.1 BLOCK_QUIC=1 BLOCK_V6=1
-    KILLSWITCH=1 FAILOVER=1 BYPASS_SRC='' BYPASS_DST='' LAN_IF='' LAN_IP=''
+    KILLSWITCH=0 FAILOVER=1 BYPASS_SRC='' BYPASS_DST='' LAN_IF='' LAN_IP=''
     SOCKS_PORT=10808 HTTP_PORT=10809 REDIR_PORT=10810 DNS_PORT=10853 API_PORT=10085 SSH_SOCKS=10811
     WEB=1 WEB_PORT=8899 WEB_AUTH=0 LOGLEVEL=warning SNIFF=1
     CHECK_URL=https://www.gstatic.com/generate_204
@@ -585,7 +585,25 @@ cmd_start() {
     i=0
     while [ $i -lt 10 ]; do is_running && break; sleep 1; i=$((i + 1)); done
     is_running && wait_ready
-    if is_running; then ok "tunnel running: $ACTIVE"; else
+    if is_running; then
+        ok "tunnel running: $ACTIVE"
+        # does traffic really pass? never leave the LAN without internet silently
+        r=$(curl_socks "$SOCKS_PORT" "$CHECK_URL")
+        if code_ok "${r%% *}"; then ok "internet through the server works"
+        else
+            r=$(curl_socks "$SOCKS_PORT" "$CHECK_URL")
+            if code_ok "${r%% *}"; then ok "internet through the server works"
+            elif [ "$KILLSWITCH" = 1 ]; then
+                err "the server does not pass traffic - kill switch ON: the LAN has NO internet until it works"
+                say "  undo: xec stop   |   allow normal internet meanwhile: xec set KILLSWITCH 0   |   details: xec diag"
+            else
+                fw_off; : >"$RUN/fw-suspended"
+                err "the server does not pass traffic - the LAN stays on the normal internet for now"
+                say "  the watchdog switches the LAN to the tunnel as soon as it works. details: xec diag"
+                log "start: $ACTIVE passes no traffic - LAN left on the normal internet"
+            fi
+        fi
+    else
         err "tunnel did not start - reason:"
         { tail -n 3 "$LOGF"; grep -v '^$' "$RUN/test.out" | tail -n 6; tail -n 6 "$LOGD/xray.log"
           logread -e xe-client 2>/dev/null | tail -n 6; } 2>/dev/null | sed 's/^/    /' >&2
@@ -623,7 +641,8 @@ probe() {
     "$XRAY" run -c "$RUN/probe-$pp.json" >"$RUN/probe-$pp.log" 2>&1 &
     xpid=$!
     r='000 0' i=0
-    while [ $i -lt 6 ]; do
+    # XEC_PROBE_TRIES: the SNI scanner uses 2 (a dead host must not cost a minute)
+    while [ $i -lt "${XEC_PROBE_TRIES:-6}" ]; do
         sleep 1
         # stop early when the client (or ssh, e.g. wrong password) is gone
         kill -0 "$xpid" 2>/dev/null || break
@@ -642,7 +661,8 @@ probe() {
         rm -f "$RUN/probe-$pp".*
         say "OK ${ms}ms"; return 0
     fi
-    why=$(cat "$RUN/probe-$pp.ssh" "$RUN/probe-$pp.log" 2>/dev/null | grep -v '^$' | tail -n 1)
+    # the real reason, not Xray's deprecation warnings
+    why=$(cat "$RUN/probe-$pp.ssh" "$RUN/probe-$pp.log" 2>/dev/null | grep -v '^$' | grep -iv 'deprecated\|\[Warning\]\|Penetrates\|unified platform\|Reading config' | tail -n 1)
     rm -f "$RUN/probe-$pp".*
     say "FAIL ${why:-no answer (HTTP ${r%% *})}"; return 1
 }
@@ -693,6 +713,7 @@ sni_import() { # FILE or http(s) URL
     esac
 }
 secs_ms() { awk -v t="$1" 'BEGIN { printf "%d", t * 1000 }'; }
+pos() { awk -v t="${1:-0}" 'BEGIN { exit !(t > 0) }'; }   # curl time > 0 (sub-millisecond counts)
 # sni_check MODE HOST PROFILE FIELD -> "OK MS DETAIL" | "FAIL 0 DETAIL"
 sni_check() {
     case $1 in
@@ -701,16 +722,16 @@ sni_check() {
             r=$(env -u http_proxy -u https_proxy -u all_proxy curl -sk -o /dev/null -w '%{http_code} %{time_appconnect}' \
                 --connect-timeout 6 --max-time 10 "https://$2/" 2>/dev/null)
             c=${r%% *} t=${r#* }
-            if [ "$(secs_ms "$t")" -gt 0 ]; then say "OK $(secs_ms "$t") tls+http_$c"; else say "FAIL 0 no-tls"; fi ;;
+            if pos "$t"; then say "OK $(secs_ms "$t") tls+http_$c"; else say "FAIL 0 no-tls"; fi ;;
         sni) # TLS handshake to YOUR server with this SNI (the bug-host test)
             load_prof "$3" >/dev/null 2>&1 || { say "FAIL 0 no-profile"; return; }
             r=$(env -u http_proxy -u https_proxy -u all_proxy curl -sk -o /dev/null -w '%{http_code} %{time_appconnect}' \
                 --connect-to "::$P_ADDR:$P_PORT" --connect-timeout 6 --max-time 10 "https://$2/" 2>/dev/null)
             t=${r#* }
-            if [ "$(secs_ms "$t")" -gt 0 ]; then say "OK $(secs_ms "$t") handshake"; else say "FAIL 0 no-handshake"; fi ;;
+            if pos "$t"; then say "OK $(secs_ms "$t") handshake"; else say "FAIL 0 no-handshake"; fi ;;
         tunnel) # the real thing: the profile with this host as SNI / address carries traffic
             case $4 in addr) o="XEC_OV_ADDR=$2" ;; both) o="XEC_OV_SNI=$2 XEC_OV_ADDR=$2" ;; *) o="XEC_OV_SNI=$2" ;; esac
-            r=$(env $o "$SELF" test "$3" </dev/null 2>/dev/null | tail -n 1)
+            r=$(env $o XEC_PROBE_TRIES=2 "$SELF" test "$3" </dev/null 2>/dev/null | tail -n 1)
             case $r in
                 *" OK "*) ms=$(printf '%s' "$r" | sed -n 's/.* OK \([0-9]*\)ms.*/\1/p'); say "OK ${ms:-0} tunnel" ;;
                 *) say "FAIL 0 tunnel" ;;
@@ -720,13 +741,29 @@ sni_check() {
 # sni_scan MODE [PROFILE] [FIELD] - checks every host (parallel), saves and prints the results
 sni_scan() {
     load_conf
+    only=0; for a in "$@"; do [ "$a" = --ok ] && only=1; done
+    set -- $(for a in "$@"; do [ "$a" = --ok ] || printf '%s ' "$a"; done)
     mode=${1:-sni} pr=${2:-$ACTIVE} fld=${3:-sni}
     match 'direct|sni|tunnel' "$mode" || die "mode: direct | sni | tunnel"
     match 'sni|addr|both' "$fld" || die "field: sni | addr | both"
     [ "$mode" = direct ] || prof_exists "$pr" || die "no profile to scan with (xec sni scan $mode PROFILE)"
     [ -s "$SNI_LIST" ] || die "the host list is empty (xec sni add HOST ... | xec sni import FILE|URL)"
     mkdir -p "$RUN"
-    total=$(wc -l <"$SNI_LIST") par=8; [ "$mode" = tunnel ] && par=3
+    src=$SNI_LIST
+    if [ $only = 1 ]; then
+        # re-check only the hosts that passed the previous scan (e.g. sni -> tunnel)
+        [ -s "$SNI_RES" ] && awk -F'\t' '$3 == "OK" { print $1 }' "$SNI_RES" >"$RUN/sni.only"
+        [ -s "$RUN/sni.only" ] || die "no working hosts in the last scan"
+        src=$RUN/sni.only
+    fi
+    total=$(wc -l <"$src") par=8; [ "$mode" = tunnel ] && par=3
+    # small routers: every tunnel probe is a whole Xray (~40 MB)
+    mem=$(awk '/MemAvailable/ { print int($2 / 1024) }' /proc/meminfo 2>/dev/null)
+    if [ -n "$mem" ]; then
+        [ "$mem" -lt 200 ] && [ "$mode" = tunnel ] && par=1
+        [ "$mem" -lt 60 ] && par=2 && [ "$mode" = tunnel ] && par=1
+        [ "$mem" -lt 40 ] && [ "$mode" = tunnel ] && die "only $mem MB of memory free - stop other programs first (see xec diag)"
+    fi
     : >"$RUN/sni.new"; printf '0 %s %s %s\n' "$total" "$mode" "$pr" >"$RUN/sni.progress"
     log "SNI scan: $total hosts, mode $mode${pr:+, profile $pr}"
     i=0
@@ -735,8 +772,9 @@ sni_scan() {
         ( printf '%s\t%s\t%s\t%s\n' "$h" "$mode" "$(sni_check "$mode" "$h" "$pr" "$fld" | tr ' ' '\t' | cut -f1-3)" "$pr" >>"$RUN/sni.new" ) </dev/null &
         i=$((i + 1))
         if [ $((i % par)) -eq 0 ]; then wait; printf '%s %s %s %s\n' "$i" "$total" "$mode" "$pr" >"$RUN/sni.progress"; fi
-    done <"$SNI_LIST"
+    done <"$src"
     wait
+    rm -f "$RUN/sni.only"
     # working first, fastest first
     awk -F'\t' '{ print ($3 == "OK" ? 0 : 1) "\t" ($4 + 0) "\t" $0 }' "$RUN/sni.new" | sort -n -k1,1 -k2,2 | cut -f3- >"$SNI_RES"
     rm -f "$RUN/sni.new" "$RUN/sni.progress"
@@ -788,7 +826,7 @@ cmd_diag() {
     say "script : xec $XEC_VERSION | $(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_DESCRIPTION") | $(uname -m) | up $(uptime | sed 's/.*up *//;s/, *load.*//')"
     say "xray   : $("$XRAY" version 2>&1 | head -n 1)"
     say "ssh    : $(ssh_bin 2>/dev/null || echo 'OpenSSH missing') | sshpass: $(command -v sshpass || echo missing)"
-    say "memory : $(free 2>/dev/null | awk '/Mem:/{printf "%d MB free of %d MB", $4/1024, $2/1024}')"
+    say "memory : $(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{printf "%d MB available of %d MB", a/1024, t/1024}' /proc/meminfo)"
     if is_running; then t="RUNNING"; else t="STOPPED"; fi
     say "tunnel : $t | active=$ACTIVE | route=$ROUTE dns_tunnel=$DNS_TUNNEL killswitch=$KILLSWITCH failover=$FAILOVER$([ -f "$RUN/fw-suspended" ] && echo ' (suspended)')"
     say "LAN    : if=$LAN_IF ip=$LAN_IP | web port $WEB_PORT (password: $([ "$WEB_AUTH" = 1 ] && echo on || echo off))"
@@ -802,6 +840,21 @@ cmd_diag() {
         say "--- config test"
         gen_xray "$ACTIVE" /tmp/xec-diag.json && "$XRAY" run -test -c /tmp/xec-diag.json 2>&1 | grep -v 'Penetrates\|unified platform\|Reading config' | tail -n 4
         rm -f /tmp/xec-diag.json
+    fi
+    if [ -n "$ACTIVE" ] && prof_exists "$ACTIVE"; then
+        load_prof "$ACTIVE"
+        say "--- path to the server (from the router, without the tunnel)"
+        a=$P_ADDR pt=$P_PORT
+        case $P_TYPE in ssh) [ "$P_TRANS" = tls ] || [ "$P_TRANS" = wss ] && sn=${P_SNI:-$P_ADDR} || sn='' ;; *) [ "$P_SEC" = none ] && sn='' || sn=${P_SNI:-$P_ADDR} ;; esac
+        r=$(env -u http_proxy -u https_proxy curl -sk -o /dev/null -m 12 --connect-timeout 8 -w '%{time_connect} %{time_appconnect} %{http_code} %{remote_ip}' \
+            --connect-to "::$a:$pt" "https://${sn:-$a}${P_PATH:-/}" ${P_HOST:+-H "Host: $P_HOST"} 2>/dev/null)
+        set -- $r
+        tc=$(secs_ms "${1:-0}") ta=$(secs_ms "${2:-0}")
+        if pos "${1:-0}"; then say "  TCP  $a:$pt (${4:-?}) ok in ${tc} ms"; else say "  TCP  $a:$pt FAILED - server address unreachable from this network"; fi
+        if [ -n "$sn" ] && pos "${1:-0}"; then
+            if pos "${2:-0}"; then say "  TLS  with SNI $sn ok in ${ta} ms, HTTP answer ${3:-?}"
+            else say "  TLS  with SNI $sn FAILED - this SNI is probably blocked here: try other hosts (SNI scanner, 'addr' or 'sni')"; fi
+        fi
     fi
     if is_running; then
         r=$(curl_socks "$SOCKS_PORT" "$CHECK_URL")
@@ -1268,13 +1321,14 @@ cmd_cgi() {
         sniuse) run_json sni_use "$(fv host)" "$(fv name)" "$(fv field)" ;;
         sniscan)
             [ -f "$RUN/sni.progress" ] && reply_err "a scan is already running"
-            m=$(fv mode) n=$(fv name) f=$(fv field)
+            m=$(fv mode) n=$(fv name) f=$(fv field) ok_only=''; [ "$(fv only)" = 1 ] && ok_only=--ok
+            [ -n "$ok_only" ] && ! grep -q "	OK	" "$SNI_RES" 2>/dev/null && reply_err "no working hosts in the last scan"
             match 'direct|sni|tunnel' "$m" || reply_err "bad mode"
             [ "$m" = direct ] || prof_exists "$n" || reply_err "choose a server"
             match 'sni|addr|both' "${f:-sni}" || reply_err "bad field"
             [ -s "$SNI_LIST" ] || reply_err "the host list is empty"
             printf '0 %s %s %s\n' "$(wc -l <"$SNI_LIST")" "$m" "$n" >"$RUN/sni.progress"
-            ( "$SELF" sni scan "$m" "$n" "${f:-sni}" ) </dev/null >"$LOGD/sni-scan.log" 2>&1 &
+            ( "$SELF" sni scan "$m" "$n" "${f:-sni}" $ok_only ) </dev/null >"$LOGD/sni-scan.log" 2>&1 &
             reply '{"ok":true,"msg":"scan started"}' ;;
         diag) dgf="$RUN/diag.$$"; (cmd_diag) >"$dgf" 2>&1; t=$(sed 's/\x1b\[[0-9;]*m//g' "$dgf" | jtext); rm -f "$dgf"; reply "{\"ok\":true,\"msg\":$t}" ;;
         start) run_json cmd_start ;;
@@ -1532,6 +1586,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
    <option value="direct">مباشر: هل الهوست نفسه يفتح من شبكتك؟</option></select>
   <div class="row"><div><label>السيرفر</label><select id="sn-prof"></select></div>
    <div><label>أين يوضع الهوست</label><select id="sn-field"><option value="sni">SNI</option><option value="addr">عنوان السيرفر (address)</option><option value="both">الاثنان</option></select></div></div><br>
+  <label class="tog" style="border:0"><span>فحص الهوستات التي نجحت في آخر فحص فقط (مثلاً: SNI ثم النفق الكامل)</span><input type="checkbox" id="sn-only"></label>
   <button class="btn" id="sn-go">ابدأ الفحص</button> <span id="sn-prog" class="mut"></span></div>
  <div class="card"><h3>النتائج</h3><p class="mut">الشغالة أولاً والأسرع أولاً. زر "استخدم" يضع الهوست في السيرفر المختار.</p>
   <table><thead><tr><th>الهوست</th><th>النتيجة</th><th>ms</th><th></th></tr></thead><tbody id="sn-res"></tbody></table></div>
@@ -1586,7 +1641,7 @@ $("sn-addb").onclick=function(){var t=$("sn-add").value;if(!t.trim())return;act(
 $("sn-file").onchange=function(){var f=this.files[0];if(!f)return;if(f.size>500000)return toast("الملف كبير جداً (الحد 500KB)",true);var r=new FileReader();r.onload=function(){act("sniadd",{hosts:r.result}).then(loadSni)};r.readAsText(f);this.value=""};
 $("sn-urlb").onclick=function(){var u=$("sn-url").value.trim();if(!/^https?:\/\//.test(u))return toast("ضع رابطاً يبدأ بـ http:// أو https://",true);act("snifetch",{url:u},this).then(loadSni)};
 $("sn-clear").onclick=function(){if(confirm("مسح قائمة الهوستات والنتائج؟"))act("sniclear",{},this).then(loadSni)};
-$("sn-go").onclick=function(){var m=$("sn-mode").value;act("sniscan",{mode:m,name:$("sn-prof").value,field:$("sn-field").value},this).then(function(){setTimeout(loadSni,800)})};
+$("sn-go").onclick=function(){var m=$("sn-mode").value;act("sniscan",{mode:m,name:$("sn-prof").value,field:$("sn-field").value,only:$("sn-only").checked?"1":"0"},this).then(function(){setTimeout(loadSni,800)})};
 $("u-go").onclick=function(){var t=prompt("سيتم حذف السكربت بالكامل. اكتب YES للتأكيد");if(t!=="YES")return toast("تم الإلغاء");
   api("uninstall",{confirm:"YES",keep:$("u-keep").checked?"1":"0",pkgs:$("u-pkgs").checked?"1":"0"}).then(function(j){toast(j.msg,!j.ok);if(j.ok){clearInterval(timer);document.querySelectorAll("button").forEach(function(b){b.disabled=true})}})};
 setInterval(function(){if(tab=="lg"&&$("lg-a").checked)loadDiag()},10000);
@@ -1906,7 +1961,8 @@ menu_sni() {
             3 | 4) m=sni; [ "$REPLY" = 4 ] && m=tunnel
                ask "server [$ACTIVE]: " || return 0; n=${REPLY:-$ACTIVE}; f=sni
                if [ "$m" = tunnel ]; then ask "put the host in: sni | addr | both [sni]: " || return 0; f=${REPLY:-sni}; fi
-               (sni_scan "$m" "$n" "$f") ;;
+               o=''; ask "only the hosts that worked in the last scan? y/N: " || return 0; [ "$REPLY" = y ] && o=--ok
+               (sni_scan "$m" "$n" "$f" $o) ;;
             5) (sni_scan direct) ;;
             6) sni_results ;;
             7) ask "host: " || return 0; h=$REPLY; ask "server [$ACTIVE]: " || return 0; n=${REPLY:-$ACTIVE}
@@ -1986,7 +2042,8 @@ XE3000 CLIENT $XEC_VERSION - router -> your server (VLESS REALITY / SSH)
   menu1  (or: xec menu)      interactive menu
   xec status | start | stop | restart | test [NAME] | ping | diag
   xec sni add HOST.. | import FILE|URL | list | clear | results
-  xec sni scan [direct|sni|tunnel] [PROFILE] [sni|addr|both]   SNI / bug-host scanner
+  xec sni scan [direct|sni|tunnel] [PROFILE] [sni|addr|both] [--ok]   SNI / bug-host scanner
+                             (--ok: only the hosts that worked in the last scan)
   xec sni use HOST [PROFILE] [sni|addr|both]                   put a working host into a server
   xec add [NAME] 'vless://UUID@HOST:443?security=reality&sni=...&pbk=...&sid=...&flow=xtls-rprx-vision&fp=chrome[&pqv=...]'
   xec add [NAME] 'vmess://BASE64-JSON'   'trojan://PASSWORD@HOST:443?security=tls&sni=...[&type=ws&path=/..][&pcs=CERT_SHA256]'
